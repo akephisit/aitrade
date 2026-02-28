@@ -93,11 +93,16 @@ pub struct TradeRecord {
     pub take_profit: f64,
     pub stop_loss: f64,
     /// Ticket number จาก MT5 (ถ้า Confirmed)
-    pub mt5_ticket: Option<u64>,
-    pub status: TradeStatus,
+    pub mt5_ticket:     Option<u64>,
+    pub status:         TradeStatus,
     /// ข้อความจาก MT5 หรือ error message
     pub status_message: String,
-    pub fired_at: DateTime<Utc>,
+    pub fired_at:       DateTime<Utc>,
+    // ── ข้อมูลตอนปิด Position (เพิ่มเมื่อ MT5 แจ้ง close) ────────────────────
+    pub close_price:    Option<f64>,
+    pub profit_pips:    Option<f64>,
+    pub close_reason:   Option<String>,  // "TP" | "SL" | "MANUAL"
+    pub closed_at:      Option<DateTime<Utc>>,
 }
 
 impl TradeRecord {
@@ -116,6 +121,10 @@ impl TradeRecord {
             status:         TradeStatus::Pending,
             status_message: "Order queued".to_string(),
             fired_at:       Utc::now(),
+            close_price:    None,
+            profit_pips:    None,
+            close_reason:   None,
+            closed_at:      None,
         }
     }
 }

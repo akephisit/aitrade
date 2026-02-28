@@ -163,7 +163,7 @@ fn simulate(req: BacktestRequest) -> BacktestResult {
 
         // Confirmation check
         use crate::engine::confirmation::ConfirmationResult;
-        match check_confirmation(tick.bid, tick.ask, &strategy.entry_zone, strategy.direction, &tick_buffer, &config) {
+        match check_confirmation(tick.bid, tick.ask, &strategy.entry_zone, strategy.direction, &tick_buffer, None, &config) {
             ConfirmationResult::Rejected { reason } => {
                 match reason {
                     "spread too wide"        => rejections.spread_too_wide += 1,

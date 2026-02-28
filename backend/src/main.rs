@@ -41,7 +41,7 @@ use routes::{
     backtest::run_backtest,
     brain::{clear_strategy, get_strategy, set_strategy},
     monitor::{get_history, get_position, get_stats, ws_monitor},
-    mt5::{handle_tick, health_check},
+    mt5::{handle_position_close, handle_tick, health_check},
     risk::{get_risk_status, kill_switch_off, kill_switch_on},
 };
 use state::build_state;
@@ -82,6 +82,7 @@ async fn main() -> anyhow::Result<()> {
         // ── Reflex Loop ───────────────────────────────────────────────────────
         .route("/api/mt5/tick",           post(handle_tick))
         .route("/api/mt5/health",         get(health_check))
+        .route("/api/mt5/position-close", post(handle_position_close))
         // ── Brain Loop ────────────────────────────────────────────────────────
         .route("/api/brain/strategy",     post(set_strategy))
         .route("/api/brain/strategy",     get(get_strategy))

@@ -39,6 +39,19 @@ pub struct TickData {
 
     /// UTC timestamp when MT5 recorded this tick.
     pub time: DateTime<Utc>,
+
+    // ── Optional Indicators (MT5 EA ส่งมาให้ได้ถ้าคำนวณผ่าน iCustom()) ──────────
+    /// RSI 14-period (0–100). ถ้าไม่ส่งมา Confirmation Engine จะข้าม RSI check
+    #[serde(default)]
+    pub rsi_14: Option<f64>,
+
+    /// Moving Average 20-period
+    #[serde(default)]
+    pub ma_20: Option<f64>,
+
+    /// Moving Average 50-period
+    #[serde(default)]
+    pub ma_50: Option<f64>,
 }
 
 impl TickData {

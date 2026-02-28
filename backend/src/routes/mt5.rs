@@ -163,6 +163,83 @@ pub async fn handle_tick(
     }
 }
 
+// ─── POST /api/mt5/position-close ────────────────────────────────────────────
+//
+// MT5 EA เรียก endpoint นี้เมื่อ Position ถูกปิด (TP / SL / Manual)
+// ทำให้ open_position = None → Double-Entry Protection รีเซ็ต → พร้อม Trade ใหม่
+
+#[derive(serde::Deserialize)]
+pub struct PositionClosePayload {
+    pub mt5_ticket:   Option<u64>,
+    pub symbol:       String,
+    pub close_price:  f64,
+    pub profit_pips:  f64,
+    /// "TP" | "SL" | "MANUAL"
+    pub close_reason: String,
+}
+
+pub async fn handle_position_close(
+    State(state): State<SharedState>,
+    Json(payload): Json<PositionClosePayload>,
+) -> impl IntoResponse {
+    // ดึง open_position ก่อน clear
+    let current_pos = {
+        let guard = state.open_position.read().await;
+        guard.clone()
+    };
+
+    if let Some(pos) = current_pos {
+        // 1. Clear open position → Reflex Loop พร้อม Trade ใหม่
+        state.set_open_position(None).await;
+
+        // 2. อัปเดต TradeRecord ใน History ด้วยข้อมูล Close
+        {
+            let mut history = state.trade_history.write().await;
+            if let Some(record) = history.iter_mut()
+                .find(|r| r.mt5_ticket == payload.mt5_ticket || r.symbol == payload.symbol)
+            {
+                record.close_price  = Some(payload.close_price);
+                record.profit_pips  = Some(payload.profit_pips);
+                record.close_reason = Some(payload.close_reason.clone());
+                record.closed_at    = Some(chrono::Utc::now());
+            }
+        }
+
+        // 3. Broadcast → Dashboard อัปเดต Real-time
+        state.broadcast(&WsEvent::PositionClosed {
+            position_id:  pos.position_id,
+            symbol:       pos.symbol.clone(),
+            direction:    format!("{:?}", pos.direction).to_uppercase(),
+            close_price:  payload.close_price,
+            profit_pips:  payload.profit_pips,
+            close_reason: payload.close_reason.clone(),
+        });
+
+        tracing::info!(
+            symbol       = %pos.symbol,
+            close_price  = payload.close_price,
+            profit_pips  = payload.profit_pips,
+            close_reason = %payload.close_reason,
+            "✅ Position closed — Reflex Loop re-armed"
+        );
+
+        Json(serde_json::json!({
+            "ok":          true,
+            "message":     "Position closed",
+            "symbol":      pos.symbol,
+            "close_price": payload.close_price,
+            "profit_pips": payload.profit_pips,
+            "close_reason": payload.close_reason,
+        }))
+    } else {
+        tracing::warn!("position-close called but no open position found");
+        Json(serde_json::json!({
+            "ok":     false,
+            "message": "No open position to close",
+        }))
+    }
+}
+
 // ─── GET /api/mt5/health ──────────────────────────────────────────────────────
 
 pub async fn health_check(State(state): State<SharedState>) -> impl IntoResponse {

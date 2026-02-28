@@ -119,6 +119,7 @@ pub async fn evaluate_tick(
         &strategy.entry_zone,
         strategy.direction,
         &tick_buffer,
+        tick.rsi_14,      // ← ส่ง RSI จาก TickData (ถ้า None → ข้าม RSI check)
         config,
     );
 

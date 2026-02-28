@@ -1,6 +1,6 @@
 // WebSocket connection manager + Svelte stores
 
-import { writable, derived } from 'svelte/store';
+import { writable } from 'svelte/store';
 
 // ── Types ──────────────────────────────────────────────────────────────────
 
@@ -45,6 +45,10 @@ export interface TradeRecord {
     status: 'PENDING' | 'CONFIRMED' | 'FAILED';
     status_message: string;
     fired_at: string;
+    close_price: number | null;
+    profit_pips: number | null;
+    close_reason: string | null;
+    closed_at: string | null;
 }
 
 export interface LogEntry {
@@ -53,6 +57,21 @@ export interface LogEntry {
     event: string;
     message: string;
     type: string;
+}
+
+export interface RiskStatus {
+    is_killed: boolean;
+    kill_reason: string | null;
+    trades_today: number;
+    consecutive_failures: number;
+    last_trade_at: string | null;
+    in_cooldown: boolean;
+    cooldown_ends_at: string | null;
+    config: {
+        max_trades_per_day: number;
+        max_consecutive_failures: number;
+        cooldown_secs_after_failure: number;
+    };
 }
 
 // ── Stores ─────────────────────────────────────────────────────────────────
@@ -64,6 +83,7 @@ export const history = writable<TradeRecord[]>([]);
 export const tickCount = writable<number>(0);
 export const tradeCount = writable<number>(0);
 export const eventLog = writable<LogEntry[]>([]);
+export const riskStatus = writable<RiskStatus | null>(null);
 
 let logIdCounter = 0;
 
@@ -75,7 +95,7 @@ function addLog(event: string, message: string, type = 'default') {
         message,
         type: type.toLowerCase().replace(' ', '_'),
     };
-    eventLog.update(logs => [entry, ...logs].slice(0, 100)); // keep last 100
+    eventLog.update(logs => [entry, ...logs].slice(0, 100));
 }
 
 // ── WebSocket Manager ─────────────────────────────────────────────────────
@@ -85,6 +105,7 @@ const API_URL = 'http://localhost:3000';
 
 let ws: WebSocket | null = null;
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+let riskPollTimer: ReturnType<typeof setInterval> | null = null;
 
 export function connectWs() {
     if (ws?.readyState === WebSocket.OPEN) return;
@@ -96,8 +117,12 @@ export function connectWs() {
         wsStatus.set('connected');
         addLog('CONNECTED', `WebSocket connected to ${WS_URL}`, 'default');
         if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
-        // Load history from REST
         fetchHistory();
+        fetchRiskStatus();
+        // Poll risk status every 5 seconds
+        if (!riskPollTimer) {
+            riskPollTimer = setInterval(fetchRiskStatus, 5000);
+        }
     };
 
     ws.onclose = () => {
@@ -106,9 +131,7 @@ export function connectWs() {
         reconnectTimer = setTimeout(connectWs, 3000);
     };
 
-    ws.onerror = () => {
-        addLog('ERROR', 'WebSocket error', 'default');
-    };
+    ws.onerror = () => { addLog('ERROR', 'WebSocket error', 'default'); };
 
     ws.onmessage = (e: MessageEvent) => {
         try {
@@ -122,6 +145,7 @@ export function connectWs() {
 
 export function disconnectWs() {
     if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+    if (riskPollTimer) { clearInterval(riskPollTimer); riskPollTimer = null; }
     ws?.close();
     ws = null;
 }
@@ -143,7 +167,7 @@ function handleEvent(data: Record<string, unknown>) {
         case 'STRATEGY_UPDATED':
             strategy.set(data.strategy as ActiveStrategy);
             addLog('STRATEGY_UPDATED',
-                `New strategy: ${(data.strategy as ActiveStrategy).direction} ${(data.strategy as ActiveStrategy).symbol}`,
+                `New: ${(data.strategy as ActiveStrategy).direction} ${(data.strategy as ActiveStrategy).symbol}`,
                 'strategy_updated');
             break;
 
@@ -154,7 +178,7 @@ function handleEvent(data: Record<string, unknown>) {
 
         case 'TRADE_FIRING':
             addLog('TRADE_FIRING',
-                `Firing trade: ${(data.record as TradeRecord).direction} @ ${(data.record as TradeRecord).entry_price}`,
+                `Firing: ${(data.record as TradeRecord).direction} @ ${(data.record as TradeRecord).entry_price}`,
                 'trade_firing');
             break;
 
@@ -162,16 +186,34 @@ function handleEvent(data: Record<string, unknown>) {
             position.set(data.position as OpenPosition);
             tradeCount.update(n => n + 1);
             addLog('POSITION_OPENED',
-                `Position opened: ${(data.position as OpenPosition).direction} @ ${(data.position as OpenPosition).entry_price} | Ticket: ${(data.position as OpenPosition).mt5_ticket ?? 'pending'}`,
+                `Opened: ${(data.position as OpenPosition).direction} @ ${(data.position as OpenPosition).entry_price} | #${(data.position as OpenPosition).mt5_ticket ?? '?'}`,
                 'position_opened');
-            fetchHistory();  // Refresh trade history
+            fetchHistory();
             break;
+
+        case 'POSITION_CLOSED': {
+            position.set(null);  // ← ล้าง position — Critical!
+            const d = data as { symbol: string; direction: string; close_price: number; profit_pips: number; close_reason: string };
+            const pips = d.profit_pips ?? 0;
+            addLog('POSITION_CLOSED',
+                `Closed ${d.direction} ${d.symbol} @ ${d.close_price} | ${pips >= 0 ? '+' : ''}${pips.toFixed(1)} pips | ${d.close_reason}`,
+                pips >= 0 ? 'position_opened' : 'trade_failed');
+            fetchHistory();
+            fetchRiskStatus();
+            break;
+        }
 
         case 'TRADE_FAILED':
             addLog('TRADE_FAILED',
-                `Trade failed: ${(data.record as TradeRecord).status_message}`,
+                `Failed: ${(data.record as TradeRecord).status_message}`,
                 'trade_failed');
             fetchHistory();
+            fetchRiskStatus();
+            break;
+
+        case 'RISK_KILLED':
+            addLog('RISK_KILLED', `⛔ Kill switch: ${data.reason}`, 'trade_failed');
+            fetchRiskStatus();
             break;
 
         case 'SERVER_STATS':
@@ -188,7 +230,33 @@ async function fetchHistory() {
         const resp = await fetch(`${API_URL}/api/monitor/history`);
         const data = await resp.json();
         history.set(data.records ?? []);
-    } catch {
-        // Silently ignore — UI will show empty state
-    }
+    } catch { /* silent */ }
+}
+
+export async function fetchRiskStatus() {
+    try {
+        const resp = await fetch(`${API_URL}/api/risk/status`);
+        const data = await resp.json();
+        riskStatus.set(data.risk ?? null);
+    } catch { /* silent */ }
+}
+
+export async function activateKillSwitch(reason = 'Manual kill from Dashboard') {
+    try {
+        await fetch(`${API_URL}/api/risk/kill`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ reason }),
+        });
+        await fetchRiskStatus();
+        addLog('RISK_KILLED', `Kill switch activated: ${reason}`, 'trade_failed');
+    } catch { /* silent */ }
+}
+
+export async function rearmSystem() {
+    try {
+        await fetch(`${API_URL}/api/risk/rearm`, { method: 'POST' });
+        await fetchRiskStatus();
+        addLog('RISK_REARMED', 'System re-armed — trading enabled', 'position_opened');
+    } catch { /* silent */ }
 }

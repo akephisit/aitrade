@@ -38,6 +38,21 @@ pub enum WsEvent {
         record: Box<TradeRecord>,
     },
 
+    /// MT5 ปิด Position แล้ว (TP / SL / Manual)
+    PositionClosed {
+        position_id:  uuid::Uuid,
+        symbol:       String,
+        direction:    String,
+        close_price:  f64,
+        profit_pips:  f64,
+        close_reason: String,   // "TP" | "SL" | "MANUAL"
+    },
+
+    /// Risk Kill Switch ถูกเปิด (ไม่ว่าจาก Auto-Kill หรือ Manual)
+    RiskKilled {
+        reason: String,
+    },
+
     /// สถิติ Server (ส่งทุก N tick เพื่อให้ Dashboard ยัง alive)
     ServerStats {
         tick_count:   u64,
