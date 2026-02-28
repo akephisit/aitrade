@@ -3,10 +3,16 @@
 //! AppState ที่ขยายแล้ว — รองรับ Position Management, Trade History,
 //! WebSocket Broadcast Channel และ shared HTTP Client
 
+use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::sync::Arc;
 use tokio::sync::{broadcast, RwLock};
 
+use crate::engine::confirmation::{ConfirmationConfig, RecentTick};
 use crate::models::{ActiveStrategy, OpenPosition, TradeRecord};
+
+/// จำนวน Tick ที่เก็บ History ต่อ Symbol
+const TICK_BUFFER_SIZE: usize = 30;
 
 // ─── AppState ─────────────────────────────────────────────────────────────────
 
@@ -42,6 +48,14 @@ pub struct AppState {
     // ── Metrics ───────────────────────────────────────────────────────────────
     pub tick_count:  Arc<std::sync::atomic::AtomicU64>,
     pub trade_count: Arc<std::sync::atomic::AtomicU64>,
+
+    // ── Tick Buffer (Confirmation Engine) ────────────────────────────────────
+    /// เก็บ Tick ย้อนหลังต่อ Symbol สำหรับ Zone Probe และ Dwell detection
+    /// Key = symbol string, Value = ล่าสุดอยู่ท้าย VecDeque
+    pub tick_buffer: Arc<RwLock<HashMap<String, VecDeque<RecentTick>>>>,
+
+    // ── Confirmation Config ───────────────────────────────────────────────────
+    pub confirmation_config: Arc<ConfirmationConfig>,
 }
 
 impl AppState {
@@ -49,13 +63,15 @@ impl AppState {
         let (broadcast_tx, _) = broadcast::channel(256);
 
         Self {
-            active_strategy: Arc::new(RwLock::new(None)),
-            open_position:   Arc::new(RwLock::new(None)),
-            trade_history:   Arc::new(RwLock::new(Vec::new())),
+            active_strategy:     Arc::new(RwLock::new(None)),
+            open_position:       Arc::new(RwLock::new(None)),
+            trade_history:       Arc::new(RwLock::new(Vec::new())),
             broadcast_tx,
-            http_client:     reqwest::Client::new(),
-            tick_count:      Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            trade_count:     Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            http_client:         reqwest::Client::new(),
+            tick_count:          Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            trade_count:         Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            tick_buffer:         Arc::new(RwLock::new(HashMap::new())),
+            confirmation_config: Arc::new(ConfirmationConfig::from_env()),
         }
     }
 
@@ -84,6 +100,26 @@ impl AppState {
     pub async fn has_open_position_for(&self, symbol: &str) -> bool {
         let guard = self.open_position.read().await;
         guard.as_ref().map(|p| p.symbol == symbol).unwrap_or(false)
+    }
+
+    /// บันทึก Tick ลง Buffer สำหรับ Confirmation Engine
+    /// เรียกทุก Tick ก่อน Reflex evaluation
+    pub async fn record_tick(&self, symbol: &str, bid: f64, ask: f64) {
+        let mut buffer = self.tick_buffer.write().await;
+        let entry = buffer
+            .entry(symbol.to_string())
+            .or_insert_with(|| VecDeque::with_capacity(TICK_BUFFER_SIZE + 1));
+
+        if entry.len() >= TICK_BUFFER_SIZE {
+            entry.pop_front();  // ลบ Tick เก่าสุด
+        }
+        entry.push_back(RecentTick::new(bid, ask));
+    }
+
+    /// อ่าน Tick Buffer ของ symbol (clone ออกมาเพื่อปล่อย lock)
+    pub async fn get_tick_buffer(&self, symbol: &str) -> VecDeque<RecentTick> {
+        let buffer = self.tick_buffer.read().await;
+        buffer.get(symbol).cloned().unwrap_or_default()
     }
 }
 
