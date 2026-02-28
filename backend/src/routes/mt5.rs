@@ -38,6 +38,29 @@ pub async fn handle_tick(
     let signal = evaluate_tick(&tick, &state).await?;
 
     match signal {
+        // ── Modify SL (Break-Even) ────────────────────────────────────────────
+        TradeSignal::ModifySL { mt5_ticket, new_sl, reason } => {
+            // อัปเดต state
+            if let Some(pos) = state.open_position.write().await.as_mut() {
+                if pos.mt5_ticket == Some(mt5_ticket) {
+                    pos.sl_moved_to_be = true;
+                    pos.stop_loss = new_sl;
+                }
+            }
+
+            // ส่งคำสั่งกลับไป MT5 (MT5 EA จะอ่านค่าจาก response นี้)
+            Ok((
+                StatusCode::OK,
+                Json(json!({
+                    "ok":         true,
+                    "action":     "MODIFY_POSITION",
+                    "mt5_ticket": mt5_ticket,
+                    "new_sl":     new_sl,
+                    "reason":     reason,
+                })),
+            ))
+        }
+
         // ── No Action — Fast path (ส่วนใหญ่จะผ่านทางนี้) ─────────────────────
         TradeSignal::NoAction => Ok((
             StatusCode::OK,

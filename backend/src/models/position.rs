@@ -50,6 +50,8 @@ pub struct OpenPosition {
     /// Ticket number จาก MT5 (มีหลังจาก Confirmed เท่านั้น)
     pub mt5_ticket: Option<u64>,
     pub opened_at: DateTime<Utc>,
+    /// สถานะเลื่อน SL วิ่งตามไปบังทุน (Break-Even) ทำไปแล้วหรือยัง?
+    pub sl_moved_to_be: bool,
 }
 
 impl OpenPosition {
@@ -65,6 +67,7 @@ impl OpenPosition {
             stop_loss: strategy.stop_loss,
             mt5_ticket: None,
             opened_at: Utc::now(),
+            sl_moved_to_be: false,
         }
     }
 

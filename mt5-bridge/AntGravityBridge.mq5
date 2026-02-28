@@ -87,6 +87,8 @@ void OnTick() {
     // ── Parse Response ─────────────────────────────────────────────────────────
     if (StringFind(response, "\"TRADE_TRIGGERED\"") >= 0) {
         HandleTradeSignal(response, tick);
+    } else if (StringFind(response, "\"MODIFY_POSITION\"") >= 0) {
+        HandleModifySignal(response);
     }
 }
 
@@ -226,6 +228,34 @@ void HandleTradeSignal(string response, const MqlTick& tick) {
     } else {
         Print("✅ Order sent | Ticket: ", res.order,
               " | Price: ", res.price, " | Retcode: ", res.retcode);
+    }
+}
+
+void HandleModifySignal(string response) {
+    long   ticket = (long)ParseDouble(response, "\"mt5_ticket\":");
+    double new_sl = ParseDouble(response, "\"new_sl\":");
+
+    if (ticket <= 0) return;
+
+    if (PositionSelectByTicket(ticket)) {
+        double current_tp = PositionGetDouble(POSITION_TP);
+        
+        MqlTradeRequest req = {};
+        MqlTradeResult  res = {};
+        
+        req.action   = TRADE_ACTION_SLTP;
+        req.position = ticket;
+        req.symbol   = PositionGetString(POSITION_SYMBOL);
+        req.sl       = new_sl;
+        req.tp       = current_tp;
+
+        if (!OrderSend(req, res)) {
+            Print("❌ ModifyPosition failed | Ticket: ", ticket, " | Error: ", GetLastError());
+        } else {
+            Print("🛡️ SL Modified (Break-Even/Trailing) | Ticket: ", ticket, " | New SL: ", new_sl);
+        }
+    } else {
+        Print("⚠️ Cannot select position for modification | Ticket: ", ticket);
     }
 }
 

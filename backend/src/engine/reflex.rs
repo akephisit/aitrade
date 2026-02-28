@@ -29,6 +29,8 @@ use crate::state::SharedState;
 pub enum TradeSignal {
     /// Price เข้า Zone + ผ่าน Confirmation → ยิง Trade
     Trigger(Box<ActiveStrategy>),
+    /// ส่งให้กลับไปสั่ง MT5 ทำการแก้ไข Position (เช่น เลื่อน SL บังทุน)
+    ModifySL { mt5_ticket: u64, new_sl: f64, reason: String },
     /// ไม่มีอะไรต้องทำ Tick นี้
     NoAction,
 }
@@ -77,9 +79,37 @@ pub async fn evaluate_tick(
         return Ok(TradeSignal::NoAction);
     }
 
-    // ── 7. Guard: Double Entry ────────────────────────────────────────────────
-    if state.has_open_position_for(&tick.symbol).await {
-        debug!(symbol = %tick.symbol, "Position already open — double-entry blocked");
+    // ── 7. Open Position Check (Double Entry / Break-Even) ────────────────────
+    if let Some(pos_guard) = state.open_position.read().await.clone() {
+        if pos_guard.symbol == tick.symbol {
+            // [NEW] Break-Even & Trailing Logic
+            if let Some(ticket) = pos_guard.mt5_ticket {
+                let pnl = match pos_guard.direction {
+                    Direction::Buy  => tick.bid - pos_guard.entry_price,
+                    Direction::Sell => pos_guard.entry_price - tick.ask,
+                    Direction::NoTrade => 0.0,
+                };
+
+                // คำนวณระยะทางถึง TP (เพื่อเอากึ่งกลาง)
+                let tp_dist = (pos_guard.take_profit - pos_guard.entry_price).abs();
+
+                // ถ้าราคาไปถึงครึ่งทางของเป้า (50% ของ TP) → เลื่อน SL มาที่ทุน
+                if tp_dist > 0.0 && pnl >= tp_dist * 0.5 && !pos_guard.sl_moved_to_be {
+                    info!(
+                        symbol = %tick.symbol,
+                        ticket,
+                        pnl,
+                        "🛡️ BREAK-EVEN TRIGGERED — Moving SL to entry price"
+                    );
+                    return Ok(TradeSignal::ModifySL {
+                        mt5_ticket: ticket,
+                        new_sl:     pos_guard.entry_price,
+                        reason:     "BREAK_EVEN".to_string(),
+                    });
+                }
+            }
+            debug!(symbol = %tick.symbol, "Position already open — double-entry blocked");
+        }
         return Ok(TradeSignal::NoAction);
     }
 
