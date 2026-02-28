@@ -1,18 +1,6 @@
 //! # routes::brain
 //!
-//! Axum route handlers for the **Brain Loop interface**.
-//!
-//! OpenClaw (or any client) calls these endpoints to install a new
-//! `ActiveStrategy` into the shared state, making it immediately visible to
-//! the Reflex Loop on the next tick.
-//!
-//! ## Endpoints
-//!
-//! | Method | Path                    | Description                                    |
-//! |--------|-------------------------|------------------------------------------------|
-//! | POST   | `/api/brain/strategy`   | Install / replace the current ActiveStrategy   |
-//! | GET    | `/api/brain/strategy`   | Read the current ActiveStrategy (if any)       |
-//! | DELETE | `/api/brain/strategy`   | Clear the current strategy (go flat / pause)   |
+//! Axum route handlers สำหรับ Brain Loop interface (OpenClaw → Axum)
 
 use axum::{
     extract::State,
@@ -24,22 +12,24 @@ use serde_json::json;
 
 use crate::{
     error::AppError,
+    events::WsEvent,
     models::ActiveStrategy,
     state::SharedState,
 };
 
 // ─── POST /api/brain/strategy ─────────────────────────────────────────────────
 
-/// Install (or replace) the `ActiveStrategy` in shared state.
-///
-/// OpenClaw calls this after completing its AI analysis.  The Reflex Loop will
-/// start evaluating ticks against this new strategy on the very next tick that
-/// arrives.
+/// OpenClaw ส่งแผนใหม่มา — ติดตั้งใน State + Broadcast แจ้ง Dashboard
 pub async fn set_strategy(
     State(state): State<SharedState>,
     Json(strategy): Json<ActiveStrategy>,
 ) -> Result<impl IntoResponse, AppError> {
     let id = strategy.strategy_id;
+
+    // Broadcast ก่อน write เพื่อให้ Dashboard เห็นทันที
+    state.broadcast(&WsEvent::StrategyUpdated {
+        strategy: Box::new(strategy.clone()),
+    });
 
     {
         let mut guard = state.active_strategy.write().await;
@@ -60,33 +50,35 @@ pub async fn set_strategy(
 
 // ─── GET /api/brain/strategy ──────────────────────────────────────────────────
 
-/// Return the currently active strategy (or a 404 if none exists).
-///
-/// The SvelteKit Monitor Loop uses this to display what the AI is currently
-/// thinking.
+/// อ่าน Strategy ปัจจุบัน (SvelteKit ใช้ Poll นี้)
 pub async fn get_strategy(
     State(state): State<SharedState>,
 ) -> Result<impl IntoResponse, AppError> {
     let guard = state.active_strategy.read().await;
 
     match guard.as_ref() {
-        Some(strategy) => Ok((StatusCode::OK, Json(json!({ "ok": true, "strategy": strategy })))),
+        Some(strategy) => Ok((
+            StatusCode::OK,
+            Json(json!({ "ok": true, "strategy": strategy })),
+        )),
         None => Err(AppError::NotFound(
-            "No active strategy. Brain Loop has not yet published a plan.".into(),
+            "No active strategy. Brain Loop has not published a plan yet.".into(),
         )),
     }
 }
 
 // ─── DELETE /api/brain/strategy ───────────────────────────────────────────────
 
-/// Clear the active strategy — disarms the Reflex Loop.
-///
-/// Call this when you want to pause trading without restarting the server.
+/// ล้าง Strategy — Disarm Reflex Loop ชั่วคราว
 pub async fn clear_strategy(
     State(state): State<SharedState>,
 ) -> impl IntoResponse {
-    let mut guard = state.active_strategy.write().await;
-    *guard = None;
+    {
+        let mut guard = state.active_strategy.write().await;
+        *guard = None;
+    }
+
+    state.broadcast(&WsEvent::StrategyCleared);
 
     tracing::info!("🧠 [BRAIN] Strategy cleared — Reflex Loop disarmed");
 

@@ -1,99 +1,149 @@
 //! # engine::executor
 //!
-//! The **Trade Executor** — responsible for sending an execution command to
-//! MetaTrader 5 once the Reflex Engine decides a trade should fire.
+//! **Trade Executor** — ยิง Order จริงไปที่ MT5 ผ่าน HTTP
 //!
-//! This module is intentionally isolated from the evaluation logic so that:
-//! * Unit tests can exercise `reflex::evaluate_tick` without needing a live MT5.
-//! * The executor can be swapped for a paper-trading stub without touching
-//!   any routing or evaluation code.
+//! ## MT5 EA API Contract (ฝั่ง MQL5)
+//! EA ต้องรับ POST `/order/send` และคืน JSON:
+//! ```json
+//! { "retcode": 10009, "order": 123456, "comment": "Request completed" }
+//! ```
+//! retcode 10009 = `TRADE_RETCODE_DONE` (สำเร็จ)
 
-use tracing::info;
+use tracing::{error, info, warn};
 
 use crate::error::AppError;
-use crate::models::{ActiveStrategy, Direction};
+use crate::models::Direction;
 
-// ─── MT5 Order Request ────────────────────────────────────────────────────────
+// ─── MT5 Request / Response ───────────────────────────────────────────────────
 
-/// The payload we send to the MT5 HTTP adapter to open a position.
-///
-/// This mirrors the fields expected by a typical MT5 EA (Expert Advisor) order
-/// endpoint.  Adjust field names to match your EA's API contract.
+/// Payload ที่ส่งไปยัง MT5 EA endpoint
 #[derive(Debug, serde::Serialize)]
 pub struct Mt5OrderRequest {
-    pub symbol: String,
-    pub action: &'static str, // "BUY" | "SELL"
-    pub volume: f64,
-    pub price: f64,
-    pub sl: f64,
-    pub tp: f64,
+    pub symbol:  String,
+    pub action:  &'static str,  // "BUY" | "SELL"
+    pub volume:  f64,
+    pub price:   f64,
+    pub sl:      f64,
+    pub tp:      f64,
     pub comment: String,
-    pub magic: u64,           // EA "magic number" for identifying orders
+    pub magic:   u64,           // Antigravity magic number
 }
 
-// ─── Executor ─────────────────────────────────────────────────────────────────
+/// Response จาก MT5 EA
+#[derive(Debug, serde::Deserialize)]
+pub struct Mt5OrderResponse {
+    /// MT5 Return Code — 10009 = SUCCESS
+    pub retcode: u32,
+    /// MT5 Ticket / Order ID (มีเมื่อ retcode = 10009)
+    pub order:   Option<u64>,
+    /// ข้อความอธิบายจาก MT5
+    pub comment: Option<String>,
+}
 
-/// Fire a trade execution command to MT5.
-///
-/// # Current Status
-/// This is a **placeholder** implementation.  It logs the order that *would*
-/// be sent and returns `Ok(())`.  Replace the body of this function with an
-/// actual `reqwest` POST to your MT5 EA HTTP endpoint.
-///
-/// # Arguments
-/// * `strategy`     — the strategy that triggered this trade.
-/// * `entry_price`  — the exact price at which the trigger was hit.
-/// * `mt5_base_url` — base URL of the MT5 HTTP adapter, e.g. `"http://localhost:8081"`.
-pub async fn fire_trade(
-    strategy: &ActiveStrategy,
+// ─── Build Order ──────────────────────────────────────────────────────────────
+
+/// สร้าง `Mt5OrderRequest` จาก Strategy + entry price
+pub fn build_order(
+    symbol: &str,
+    direction: Direction,
     entry_price: f64,
-    mt5_base_url: &str,
-) -> Result<(), AppError> {
-    let action = match strategy.direction {
-        Direction::Buy => "BUY",
+    sl: f64,
+    tp: f64,
+    lot_size: f64,
+    strategy_id: uuid::Uuid,
+) -> Result<Mt5OrderRequest, AppError> {
+    let action = match direction {
+        Direction::Buy  => "BUY",
         Direction::Sell => "SELL",
         Direction::NoTrade => {
             return Err(AppError::BadRequest(
-                "Cannot fire trade with NoTrade direction".into(),
+                "Cannot build order for NoTrade direction".into(),
             ))
         }
     };
 
-    let order = Mt5OrderRequest {
-        symbol:  strategy.symbol.clone(),
+    Ok(Mt5OrderRequest {
+        symbol:  symbol.to_string(),
         action,
-        volume:  strategy.lot_size,
+        volume:  lot_size,
         price:   entry_price,
-        sl:      strategy.stop_loss,
-        tp:      strategy.take_profit,
-        comment: format!("AGV-{}", strategy.strategy_id),
-        magic:   420001, // Unique magic number for Antigravity orders
-    };
+        sl,
+        tp,
+        comment: format!("AGV-{}", &strategy_id.to_string()[..8]),
+        magic:   420001,
+    })
+}
+
+// ─── Fire Trade ───────────────────────────────────────────────────────────────
+
+/// ส่ง Order ไปที่ MT5 EA และรอ Response
+///
+/// คืน `Mt5OrderResponse` ถ้าสำเร็จ, `AppError::ExecutionError` ถ้าล้มเหลว
+pub async fn fire_trade(
+    order: &Mt5OrderRequest,
+    client: &reqwest::Client,
+    mt5_base_url: &str,
+) -> Result<Mt5OrderResponse, AppError> {
+    let url = format!("{mt5_base_url}/order/send");
 
     info!(
-        ?order,
-        mt5_url = mt5_base_url,
-        "🚀 [EXECUTOR] Sending trade order to MT5 (PLACEHOLDER — not sent)"
+        symbol    = %order.symbol,
+        action    = %order.action,
+        volume    = order.volume,
+        price     = order.price,
+        sl        = order.sl,
+        tp        = order.tp,
+        mt5_url   = %url,
+        "🚀 [EXECUTOR] Sending order to MT5"
     );
 
-    // ── TODO: Replace with real HTTP call ────────────────────────────────────
-    //
-    // let client = reqwest::Client::new();
-    // let response = client
-    //     .post(format!("{mt5_base_url}/order/send"))
-    //     .json(&order)
-    //     .send()
-    //     .await
-    //     .map_err(|e| AppError::ExecutionError(e.to_string()))?;
-    //
-    // if !response.status().is_success() {
-    //     let body = response.text().await.unwrap_or_default();
-    //     error!(body, "MT5 rejected the order");
-    //     return Err(AppError::ExecutionError(body));
-    // }
-    //
-    // info!("✅ MT5 order accepted");
-    // ─────────────────────────────────────────────────────────────────────────
+    // ── HTTP POST ─────────────────────────────────────────────────────────────
+    let response = client
+        .post(&url)
+        .json(order)
+        .timeout(std::time::Duration::from_secs(5))   // ห้ามรอนานกว่า 5 วิ
+        .send()
+        .await
+        .map_err(|e| {
+            error!(error = %e, "MT5 unreachable");
+            AppError::ExecutionError(format!("MT5 unreachable: {e}"))
+        })?;
 
-    Ok(())
+    // ── HTTP Status ───────────────────────────────────────────────────────────
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        error!(http_status = %status, body = %body, "MT5 returned HTTP error");
+        return Err(AppError::ExecutionError(
+            format!("MT5 HTTP {status}: {body}")
+        ));
+    }
+
+    // ── Parse Response ────────────────────────────────────────────────────────
+    let mt5_resp: Mt5OrderResponse = response
+        .json()
+        .await
+        .map_err(|e| {
+            error!(error = %e, "MT5 response parse failed");
+            AppError::ExecutionError(format!("MT5 response parse error: {e}"))
+        })?;
+
+    // ── Check retcode ─────────────────────────────────────────────────────────
+    // 10009 = TRADE_RETCODE_DONE (เท่านั้นที่ถือว่า success)
+    if mt5_resp.retcode != 10009 {
+        let msg = format!(
+            "MT5 rejected: retcode={} comment={}",
+            mt5_resp.retcode,
+            mt5_resp.comment.as_deref().unwrap_or("unknown")
+        );
+        warn!("{msg}");
+        return Err(AppError::ExecutionError(msg));
+    }
+
+    info!(
+        ticket = ?mt5_resp.order,
+        "✅ [EXECUTOR] MT5 accepted order"
+    );
+
+    Ok(mt5_resp)
 }

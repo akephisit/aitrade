@@ -1,13 +1,6 @@
 //! # routes::mt5
 //!
-//! Axum route handlers for the **MetaTrader 5 interface**.
-//!
-//! ## Endpoints
-//!
-//! | Method | Path                    | Description                                      |
-//! |--------|-------------------------|--------------------------------------------------|
-//! | POST   | `/api/mt5/tick`         | Receive a price tick, run Reflex evaluation      |
-//! | GET    | `/api/mt5/health`       | MT5 adapter connectivity check                   |
+//! Axum route handlers สำหรับ MetaTrader 5 interface (Reflex Loop)
 
 use axum::{
     extract::State,
@@ -16,122 +9,155 @@ use axum::{
     Json,
 };
 use serde_json::json;
+use std::sync::atomic::Ordering;
 use tracing::error;
 
 use crate::{
     engine::{
-        executor::fire_trade,
+        executor::{build_order, fire_trade},
         reflex::{evaluate_tick, TradeSignal},
     },
     error::AppError,
-    models::TickData,
+    events::WsEvent,
+    models::{
+        position::{OpenPosition, TradeRecord, TradeStatus},
+        Direction, TickData,
+    },
     state::SharedState,
 };
 
 // ─── POST /api/mt5/tick ───────────────────────────────────────────────────────
 
-/// **Reflex Loop entry point.**
-///
-/// MT5 calls this endpoint on every price update (or every N milliseconds for
-/// high-frequency instruments).  The handler must return quickly — it delegates
-/// all heavy logic to the engine layer.
-///
-/// ### Request body (JSON)
-/// ```json
-/// {
-///   "symbol": "BTCUSD",
-///   "bid": 67010.50,
-///   "ask": 67012.00,
-///   "volume": 1.5,
-///   "time": "2025-01-01T12:00:00Z"
-/// }
-/// ```
-///
-/// ### Response
-/// * `200 OK` with `{ "ok": true, "action": "NO_ACTION" | "TRADE_TRIGGERED" }`
-/// * `4xx / 5xx` on errors (see [`AppError`])
+/// **Reflex Loop entry point** — รับ Tick จาก MT5, ประเมิน, ยิง Trade (ถ้าถึงเวลา)
 pub async fn handle_tick(
     State(state): State<SharedState>,
     Json(tick): Json<TickData>,
 ) -> Result<impl IntoResponse, AppError> {
-    // ── Step 1: Run the Reflex Engine evaluation ──────────────────────────────
+    // ── 1. Reflex Engine ──────────────────────────────────────────────────────
     let signal = evaluate_tick(&tick, &state).await?;
 
-    // ── Step 2: Act on the signal ─────────────────────────────────────────────
     match signal {
-        TradeSignal::NoAction => {
-            // Fast path — vast majority of ticks land here.
-            Ok((
-                StatusCode::OK,
-                Json(json!({
-                    "ok":     true,
-                    "action": "NO_ACTION",
-                    "symbol": tick.symbol,
-                    "bid":    tick.bid,
-                    "ask":    tick.ask,
-                })),
-            ))
-        }
+        // ── No Action — Fast path (ส่วนใหญ่จะผ่านทางนี้) ─────────────────────
+        TradeSignal::NoAction => Ok((
+            StatusCode::OK,
+            Json(json!({
+                "ok":     true,
+                "action": "NO_ACTION",
+                "symbol": tick.symbol,
+                "bid":    tick.bid,
+                "ask":    tick.ask,
+            })),
+        )),
 
+        // ── Trade Triggered ───────────────────────────────────────────────────
         TradeSignal::Trigger(strategy) => {
-            // ── Step 2a: Determine the exact fill price ───────────────────────
+            // ── 2. Entry price ────────────────────────────────────────────────
             let entry_price = match strategy.direction {
-                crate::models::Direction::Buy  => tick.ask,
-                crate::models::Direction::Sell => tick.bid,
-                crate::models::Direction::NoTrade => tick.effective_mid(),
+                Direction::Buy  => tick.ask,
+                Direction::Sell => tick.bid,
+                Direction::NoTrade => tick.effective_mid(),
             };
 
-            // ── Step 2b: Delegate to the executor ────────────────────────────
-            // We intentionally do NOT await a response here in the hot path if
-            // you need sub-millisecond latency — use `tokio::spawn` to fire and
-            // forget.  For now we await for simplicity and observability.
-            let mt5_url = std::env::var("MT5_BASE_URL")
-                .unwrap_or_else(|_| "http://localhost:8081".to_string());
+            // ── 3. Build MT5 order ────────────────────────────────────────────
+            let order = build_order(
+                &strategy.symbol,
+                strategy.direction,
+                entry_price,
+                strategy.stop_loss,
+                strategy.take_profit,
+                strategy.lot_size,
+                strategy.strategy_id,
+            )?;
 
-            if let Err(e) = fire_trade(&strategy, entry_price, &mt5_url).await {
-                error!(error = %e, "Trade execution failed");
-                return Err(e);
-            }
+            // ── 4. สร้าง TradeRecord (สถานะ Pending) ──────────────────────────
+            let mut record = TradeRecord::from_strategy(&strategy, entry_price);
 
-            // ── Step 2c: After firing, clear the strategy so we don't
-            //    double-trigger on the next tick (one trade per signal). ───────
+            // ── 5. Broadcast "กำลังยิง Trade" ─────────────────────────────────
+            state.broadcast(&WsEvent::TradeFiring {
+                record: Box::new(record.clone()),
+            });
+
+            // ── 6. ล้าง ActiveStrategy ก่อน I/O ──────────────────────────────
+            //    ป้องกัน Tick ที่เข้ามาระหว่างรอ MT5ตอบ trigger ซ้ำ
             {
                 let mut guard = state.active_strategy.write().await;
                 *guard = None;
             }
 
-            Ok((
-                StatusCode::OK,
-                Json(json!({
-                    "ok":          true,
-                    "action":      "TRADE_TRIGGERED",
-                    "strategy_id": strategy.strategy_id,
-                    "symbol":      strategy.symbol,
-                    "direction":   strategy.direction,
-                    "entry_price": entry_price,
-                    "tp":          strategy.take_profit,
-                    "sl":          strategy.stop_loss,
-                })),
-            ))
+            // ── 7. ยิง Order จริงไป MT5 ───────────────────────────────────────
+            let mt5_url = std::env::var("MT5_BASE_URL")
+                .unwrap_or_else(|_| "http://localhost:8081".to_string());
+
+            match fire_trade(&order, &state.http_client, &mt5_url).await {
+                Ok(mt5_resp) => {
+                    // ── 7a. SUCCESS ───────────────────────────────────────────
+                    let ticket = mt5_resp.order;
+                    record.status         = TradeStatus::Confirmed;
+                    record.mt5_ticket     = ticket;
+                    record.status_message = mt5_resp.comment
+                        .unwrap_or_else(|| "Request completed".to_string());
+
+                    // เปิด Position ใน State
+                    let mut position = OpenPosition::from_strategy(&strategy, entry_price);
+                    position.mt5_ticket = ticket;
+
+                    state.set_open_position(Some(position.clone())).await;
+                    state.push_trade_record(record.clone()).await;
+
+                    // Broadcast
+                    state.broadcast(&WsEvent::PositionOpened {
+                        position: Box::new(position.clone()),
+                    });
+
+                    Ok((
+                        StatusCode::OK,
+                        Json(json!({
+                            "ok":          true,
+                            "action":      "TRADE_TRIGGERED",
+                            "strategy_id": strategy.strategy_id,
+                            "trade_id":    record.trade_id,
+                            "symbol":      strategy.symbol,
+                            "direction":   strategy.direction,
+                            "entry_price": entry_price,
+                            "tp":          strategy.take_profit,
+                            "sl":          strategy.stop_loss,
+                            "mt5_ticket":  ticket,
+                        })),
+                    ))
+                }
+
+                Err(e) => {
+                    // ── 7b. FAILED ────────────────────────────────────────────
+                    error!(error = %e, "Trade execution failed");
+
+                    record.status         = TradeStatus::Failed;
+                    record.status_message = e.to_string();
+
+                    state.push_trade_record(record.clone()).await;
+                    state.broadcast(&WsEvent::TradeFailed {
+                        record: Box::new(record),
+                    });
+
+                    Err(e)
+                }
+            }
         }
     }
 }
 
 // ─── GET /api/mt5/health ──────────────────────────────────────────────────────
 
-/// Simple health-check for the MT5 adapter.
-/// The SvelteKit Monitor Loop polls this to display MT5 connectivity status.
-pub async fn health_check(
-    State(state): State<SharedState>,
-) -> impl IntoResponse {
-    let tick_count  = state.tick_count.load(std::sync::atomic::Ordering::Relaxed);
-    let trade_count = state.trade_count.load(std::sync::atomic::Ordering::Relaxed);
+pub async fn health_check(State(state): State<SharedState>) -> impl IntoResponse {
+    let tick_count   = state.tick_count.load(Ordering::Relaxed);
+    let trade_count  = state.trade_count.load(Ordering::Relaxed);
     let has_strategy = state.active_strategy.read().await.is_some();
+    let has_position = state.open_position.read().await.is_some();
 
     Json(json!({
         "ok":           true,
         "tick_count":   tick_count,
         "trade_count":  trade_count,
         "has_strategy": has_strategy,
+        "has_position": has_position,
     }))
 }

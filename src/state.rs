@@ -1,73 +1,99 @@
 //! # state
 //!
-//! The Antigravity **shared application state** — the single source of truth
-//! that both the Brain Loop (writes) and Reflex Loop (reads) share.
-//!
-//! ## Design Decisions
-//!
-//! * `Arc<AppState>` is cloned cheaply into every Axum handler via
-//!   `axum::extract::State`.
-//! * `RwLock<Option<ActiveStrategy>>` allows *many concurrent readers* (Reflex
-//!   Loop ticks) with *exclusive writer access* (Brain Loop updates).
-//! * We deliberately avoid `Mutex` here: a `Mutex` would serialise all tick
-//!   reads, which is unacceptable at high tick frequency.
-//!
-//! ## Thread‑Safety Guarantee
-//!
-//! The `RwLock` from `tokio::sync` is async-aware, so neither readers nor the
-//! single writer ever block an OS thread — they yield cooperatively to the
-//! Tokio runtime.
+//! AppState ที่ขยายแล้ว — รองรับ Position Management, Trade History,
+//! WebSocket Broadcast Channel และ shared HTTP Client
 
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{broadcast, RwLock};
 
-use crate::models::ActiveStrategy;
+use crate::models::{ActiveStrategy, OpenPosition, TradeRecord};
 
 // ─── AppState ─────────────────────────────────────────────────────────────────
 
 /// Top-level shared state injected into every Axum handler.
-///
-/// Clone this via `Arc::clone` — the `Arc` wrapper makes that O(1).
 #[derive(Clone)]
 pub struct AppState {
-    /// The current trade plan published by the Brain Loop (OpenClaw).
-    ///
-    /// `None` means no strategy has been established yet; the Reflex Loop
-    /// must **not** fire any trades in that case.
+    // ── Brain Loop ────────────────────────────────────────────────────────────
+    /// แผนการเทรดปัจจุบันจาก OpenClaw
+    /// None = ยังไม่มีแผน หรือ แผนถูกล้างหลังจาก Trade fired
     pub active_strategy: Arc<RwLock<Option<ActiveStrategy>>>,
 
-    /// Counter of how many ticks have been processed.  Useful for health-check
-    /// dashboards and detecting MT5 disconnects (counter stalls).
-    pub tick_count: Arc<std::sync::atomic::AtomicU64>,
+    // ── Position Management ───────────────────────────────────────────────────
+    /// Position ที่เปิดอยู่ใน MT5 ณ ตอนนี้
+    /// None = ไม่มี Position เปิด → Reflex Loop พร้อม trade
+    /// Some = มี Position อยู่แล้ว → ห้าม Double Entry
+    pub open_position: Arc<RwLock<Option<OpenPosition>>>,
 
-    /// Counter of how many trade execution commands have been fired this
-    /// session.  Monotonically increasing.
+    // ── Trade History ─────────────────────────────────────────────────────────
+    /// บันทึกทุก Order ที่เคยยิง (ไม่มีวันลบ — ใช้สำหรับ Dashboard)
+    /// ในอนาคตจะ persist ลง PostgreSQL
+    pub trade_history: Arc<RwLock<Vec<TradeRecord>>>,
+
+    // ── Monitor / WebSocket ───────────────────────────────────────────────────
+    /// Broadcast channel สำหรับส่ง Event ไปยัง WebSocket clients
+    /// ใช้ String (pre-serialized JSON) เพื่อหลีกเลี่ยง Clone constraints
+    pub broadcast_tx: broadcast::Sender<String>,
+
+    // ── HTTP Client ───────────────────────────────────────────────────────────
+    /// reqwest Client ที่ share กันทั้งระบบ (thread-safe, connection pooling)
+    /// สร้างครั้งเดียว ไม่ต้องสร้างใหม่ทุก Request
+    pub http_client: reqwest::Client,
+
+    // ── Metrics ───────────────────────────────────────────────────────────────
+    pub tick_count:  Arc<std::sync::atomic::AtomicU64>,
     pub trade_count: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl AppState {
-    /// Construct a fresh, empty application state.
     pub fn new() -> Self {
+        let (broadcast_tx, _) = broadcast::channel(256);
+
         Self {
             active_strategy: Arc::new(RwLock::new(None)),
-            tick_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            trade_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            open_position:   Arc::new(RwLock::new(None)),
+            trade_history:   Arc::new(RwLock::new(Vec::new())),
+            broadcast_tx,
+            http_client:     reqwest::Client::new(),
+            tick_count:      Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            trade_count:     Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
+    }
+
+    // ── Helper Methods ────────────────────────────────────────────────────────
+
+    /// Broadcast WsEvent ไปยัง WebSocket clients ทั้งหมด
+    /// ไม่ panic ถ้าไม่มี listener (ปลอดภัยสำหรับ headless mode)
+    pub fn broadcast(&self, event: &crate::events::WsEvent) {
+        // Err เกิดขึ้นเมื่อไม่มี receiver — ไม่ใช่ error จริงๆ
+        let _ = self.broadcast_tx.send(event.to_json());
+    }
+
+    /// เพิ่ม TradeRecord เข้า history
+    pub async fn push_trade_record(&self, record: TradeRecord) {
+        let mut history = self.trade_history.write().await;
+        history.push(record);
+    }
+
+    /// อัปเดต open_position (None = ปิด Position แล้ว)
+    pub async fn set_open_position(&self, position: Option<OpenPosition>) {
+        let mut guard = self.open_position.write().await;
+        *guard = position;
+    }
+
+    /// เช็คว่ามี open position สำหรับ symbol นี้ไหม
+    pub async fn has_open_position_for(&self, symbol: &str) -> bool {
+        let guard = self.open_position.read().await;
+        guard.as_ref().map(|p| p.symbol == symbol).unwrap_or(false)
     }
 }
 
 impl Default for AppState {
-    fn default() -> Self {
-        Self::new()
-    }
+    fn default() -> Self { Self::new() }
 }
 
-/// Convenience type alias so callers can write `SharedState` instead of the
-/// full generic form.
+/// Convenience type alias
 pub type SharedState = Arc<AppState>;
 
-/// Construct the shared application state and wrap it in an `Arc` ready for
-/// injection into the Axum router.
 pub fn build_state() -> SharedState {
     Arc::new(AppState::new())
 }
