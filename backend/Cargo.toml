@@ -40,3 +40,18 @@ futures-util = "0.3"
 
 # --- HTTP Client (for outbound calls to OpenClaw / MT5) ---
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+
+# --- Database (PostgreSQL) ---
+# ใช้ feature "bigdecimal" สำหรับ NUMERIC columns + runtime-tokio-rustls สำหรับ TLS
+sqlx = { version = "0.7", features = [
+  "runtime-tokio-rustls",
+  "postgres",
+  "uuid",
+  "chrono",
+  "bigdecimal",
+], optional = true }
+bigdecimal = { version = "0.4", optional = true }
+
+[features]
+# ถ้าต้องการ PostgreSQL: cargo run --features postgres
+postgres = ["dep:sqlx", "dep:bigdecimal"]

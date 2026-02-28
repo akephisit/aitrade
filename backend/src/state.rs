@@ -10,6 +10,7 @@ use tokio::sync::{broadcast, RwLock};
 
 use crate::engine::confirmation::{ConfirmationConfig, RecentTick};
 use crate::models::{ActiveStrategy, OpenPosition, TradeRecord};
+use crate::risk::{RiskConfig, RiskManager};
 
 /// จำนวน Tick ที่เก็บ History ต่อ Symbol
 const TICK_BUFFER_SIZE: usize = 30;
@@ -56,6 +57,9 @@ pub struct AppState {
 
     // ── Confirmation Config ───────────────────────────────────────────────────
     pub confirmation_config: Arc<ConfirmationConfig>,
+
+    // ── Risk Management ─────────────────────────────────────────────────
+    pub risk: Arc<RiskManager>,
 }
 
 impl AppState {
@@ -72,6 +76,7 @@ impl AppState {
             trade_count:         Arc::new(std::sync::atomic::AtomicU64::new(0)),
             tick_buffer:         Arc::new(RwLock::new(HashMap::new())),
             confirmation_config: Arc::new(ConfirmationConfig::from_env()),
+            risk:                Arc::new(RiskManager::new(RiskConfig::from_env())),
         }
     }
 

@@ -23,6 +23,7 @@ use crate::{
         position::{OpenPosition, TradeRecord, TradeStatus},
         Direction, TickData,
     },
+    risk::RiskDecision,
     state::SharedState,
 };
 
@@ -51,7 +52,22 @@ pub async fn handle_tick(
 
         // ── Trade Triggered ───────────────────────────────────────────────────
         TradeSignal::Trigger(strategy) => {
-            // ── 2. Entry price ────────────────────────────────────────────────
+            // ── 2. Risk Check ────────────────────────────────────────────────────────────
+            match state.risk.pre_trade_check().await {
+                RiskDecision::Blocked(reason) => {
+                    return Ok((
+                        StatusCode::OK,
+                        Json(json!({
+                            "ok":     false,
+                            "action": "RISK_BLOCKED",
+                            "reason": reason,
+                        })),
+                    ));
+                }
+                RiskDecision::Approved => {}
+            }
+
+            // ── 3. Entry price ────────────────────────────────────────────────────────────
             let entry_price = match strategy.direction {
                 Direction::Buy  => tick.ask,
                 Direction::Sell => tick.bid,
@@ -103,6 +119,7 @@ pub async fn handle_tick(
 
                     state.set_open_position(Some(position.clone())).await;
                     state.push_trade_record(record.clone()).await;
+                    state.risk.record_success().await;  // ✅ Reset consecutive failures
 
                     // Broadcast
                     state.broadcast(&WsEvent::PositionOpened {
@@ -134,6 +151,7 @@ pub async fn handle_tick(
                     record.status_message = e.to_string();
 
                     state.push_trade_record(record.clone()).await;
+                    state.risk.record_failure().await;  // ❌ Increment consecutive failures
                     state.broadcast(&WsEvent::TradeFailed {
                         record: Box::new(record),
                     });
