@@ -61,6 +61,20 @@ pub async fn handle_tick(
             ))
         }
 
+        // ── Close Position ──────────────────────────────────────────────────────
+        TradeSignal::ClosePosition { mt5_ticket, reason } => {
+            // เราบอก MT5 EA ผ่าน HTTP response นี้ ให้มันไปจัดการ OrderClose
+            Ok((
+                StatusCode::OK,
+                Json(json!({
+                    "ok":         true,
+                    "action":     "CLOSE_POSITION",
+                    "mt5_ticket": mt5_ticket,
+                    "reason":     reason,
+                })),
+            ))
+        }
+
         // ── No Action — Fast path (ส่วนใหญ่จะผ่านทางนี้) ─────────────────────
         TradeSignal::NoAction => Ok((
             StatusCode::OK,

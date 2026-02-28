@@ -51,10 +51,11 @@ STRATEGY_RESP=$(curl -sf -X POST "${BASE_URL}/api/brain/strategy" \
     -d '{
         "strategy_id": "00000000-0000-0000-0000-000000000001",
         "symbol": "BTCUSD",
-        "direction": "Buy",
+        "direction": "BUY",
         "entry_zone": { "low": 67000.0, "high": 67050.0 },
         "take_profit": 67300.0,
         "stop_loss":   66800.0,
+        "opposing_zone": { "low": 67250.0, "high": 67280.0 },
         "lot_size":    0.01,
         "rationale":   "Demo: Support bounce at 67000",
         "created_at":  "'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"'",
@@ -96,11 +97,15 @@ ok "Ticks below zone_low sent (Zone Probe will be detected)"
 
 sleep 0.3
 
-# ── 4. ส่ง Ticks เข้า Zone ────────────────────────────────────────────────────
-header "Step 4: Enter Entry Zone + Confirmation"
-log "Sending ticks INTO zone (67000-67050, RSI=55)..."
+# ── 4. ส่ง Ticks เข้า Zone (Wick Rejection Builder) ────────────────────────
+header "Step 4: Enter Entry Zone + SMC Wick Rejection Formation"
+log "Sending 5+ ticks INTO zone to form a rejection candle (M1)..."
 
-for i in 67005 67010 67015 67020; do
+# จำลองแท่งเทียน: 
+# Open: 67035 (นอกโซน)
+# Drop: 66990 (กวาดสภาพคล่อง ลึกสุด)
+# Climb: 67010 -> 67020 -> 67025 (ราคากลับขึ้นมา ปิดใน/ใกล้โซน ทิ้งไส้ยาว)
+for i in 67035 66990 67010 67020 67025 67026; do
     RESP=$(curl -sf -X POST "${BASE_URL}/api/mt5/tick" \
         -H "Content-Type: application/json" \
         -d "{
@@ -134,6 +139,30 @@ if [ -z "$TRADE_FIRED" ]; then
     warn "Trade not triggered (confirmation check may need more ticks)"
     warn "This is expected — try adjusting CONFIRM_MIN_ZONE_TICKS=1 in .env for demo"
 fi
+
+# ── 4.5 จำลอง Opposing Zone Bailout ──────────────────────────────────────────
+header "Step 4.5: Opposing Zone Bailout Check"
+log "Sending ticks to Opposing Zone (67250-67280)..."
+RESP=$(curl -sf -X POST "${BASE_URL}/api/mt5/tick" \
+    -H "Content-Type: application/json" \
+    -d "{
+        \"symbol\": \"BTCUSD\",
+        \"bid\": 67260,
+        \"ask\": 67262,
+        \"volume\": 5.0,
+        \"time\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",
+        \"rsi_14\": 75.0,
+        \"ma_20\": 66950.0,
+        \"ma_50\": 66800.0
+    }")
+
+if echo "$RESP" | grep -q "CLOSE_POSITION"; then
+    ok "⚔️ Bailout triggered! Price entered opposing zone (67260)."
+else
+    warn "Bailout not triggered. Response: $RESP"
+fi
+
+sleep 0.3
 
 # ── 5. ดู Current State ────────────────────────────────────────────────────────
 header "Step 5: Current State"

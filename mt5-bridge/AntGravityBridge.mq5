@@ -89,6 +89,8 @@ void OnTick() {
         HandleTradeSignal(response, tick);
     } else if (StringFind(response, "\"MODIFY_POSITION\"") >= 0) {
         HandleModifySignal(response);
+    } else if (StringFind(response, "\"CLOSE_POSITION\"") >= 0) {
+        HandleCloseSignal(response);
     }
 }
 
@@ -256,6 +258,38 @@ void HandleModifySignal(string response) {
         }
     } else {
         Print("⚠️ Cannot select position for modification | Ticket: ", ticket);
+    }
+}
+
+void HandleCloseSignal(string response) {
+    long   ticket = (long)ParseDouble(response, "\"mt5_ticket\":");
+    if (ticket <= 0) return;
+
+    if (PositionSelectByTicket(ticket)) {
+        double current_volume = PositionGetDouble(POSITION_VOLUME);
+        ENUM_POSITION_TYPE pos_type = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+        
+        MqlTradeRequest req = {};
+        MqlTradeResult  res = {};
+        
+        req.action = TRADE_ACTION_DEAL;
+        req.position = ticket;
+        req.symbol = PositionGetString(POSITION_SYMBOL);
+        req.volume = current_volume;
+        req.type = (pos_type == POSITION_TYPE_BUY) ? ORDER_TYPE_SELL : ORDER_TYPE_BUY;
+        req.price = (pos_type == POSITION_TYPE_BUY) ? SymbolInfoDouble(req.symbol, SYMBOL_BID) : SymbolInfoDouble(req.symbol, SYMBOL_ASK);
+        req.deviation = 10;
+        req.magic = 202600;
+        req.comment = "AGV: Close Signal";
+        req.type_filling = ORDER_FILLING_IOC;
+
+        if (!OrderSend(req, res)) {
+            Print("❌ ClosePosition failed | Ticket: ", ticket, " | Error: ", GetLastError());
+        } else {
+            Print("⚔️ Position Closed (Bailout) | Ticket: ", ticket);
+        }
+    } else {
+        Print("⚠️ Cannot select position for closing | Ticket: ", ticket);
     }
 }
 

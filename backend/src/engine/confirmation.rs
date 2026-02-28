@@ -54,7 +54,15 @@ pub struct ConfirmationConfig {
     /// แนะนำ: 10-20 ticks
     pub probe_lookback: usize,
 
-    // ── [4] RSI Filter ─────────────────────────────────────────────────────
+    // ── [4] Wick Rejection (SMC Style) ────────────────────────────────────
+    /// ต้องเกิด Rejection Wick (หางยาวตบกลับ) ในแท่ง M1 ก่อนเข้าไหม?
+    pub require_wick_rejection: bool,
+
+    /// ความยาวชองไส้เทียนที่จะถือว่าเป็น Rejection (สัดส่วนร้อยละของทั้งแท่ง)
+    /// แนะนำ: 0.60 (60%)
+    pub min_wick_ratio: f64,
+
+    // ── [5] RSI Filter ─────────────────────────────────────────────────────
     /// RSI ที่เรียกว่า Overbought (สำหรับ BUY: ทางเปิดเมื่อ RSI < overbought)
     /// ถ้า TickData ไม่เห็น rsi_14 → ข้าม RSI check
     pub rsi_overbought: f64,
@@ -74,6 +82,10 @@ impl ConfirmationConfig {
                 .ok().and_then(|v| v.parse().ok()).unwrap_or(2),
             probe_lookback:    std::env::var("CONFIRM_PROBE_LOOKBACK")
                 .ok().and_then(|v| v.parse().ok()).unwrap_or(15),
+            require_wick_rejection: std::env::var("CONFIRM_REQUIRE_WICK_REJECTION")
+                .map(|v| v != "false" && v != "0").unwrap_or(true),
+            min_wick_ratio:    std::env::var("CONFIRM_MIN_WICK_RATIO")
+                .ok().and_then(|v| v.parse().ok()).unwrap_or(0.60),
             rsi_overbought:    std::env::var("CONFIRM_RSI_OVERBOUGHT")
                 .ok().and_then(|v| v.parse().ok()).unwrap_or(70.0),
             rsi_oversold:      std::env::var("CONFIRM_RSI_OVERSOLD")
@@ -127,6 +139,7 @@ pub enum ConfirmationResult {
 /// * `zone`     — Entry Zone จาก ActiveStrategy
 /// * `dir`      — BUY หรือ SELL
 /// * `buffer`   — Tick Buffer ย้อนหลัง (ล่าสุดอยู่ท้าย VecDeque)
+/// * `candle`   — แท่งเทียน M1 ปัจจุบัน
 /// * `rsi`      — RSI ปัจจุบัน (ส่ง None ถ้า MT5 ไม่คำนวณหรือไม่ส่งมา → ข้ามได้)
 /// * `config`   — Confirmation parameters
 pub fn check_confirmation(
@@ -135,6 +148,7 @@ pub fn check_confirmation(
     zone:        &EntryZone,
     dir:         Direction,
     buffer:      &VecDeque<RecentTick>,
+    candle:      Option<&crate::engine::candle_builder::Candle>,
     rsi:         Option<f64>,
     config:      &ConfirmationConfig,
 ) -> ConfirmationResult {
@@ -231,6 +245,29 @@ pub fn check_confirmation(
         debug!("— RSI not available, skipping RSI check");
     }
 
+    // ── [5] Wick Rejection (SMC Style) ──────────────────────────────────────
+    if config.require_wick_rejection {
+        if let Some(c) = candle {
+            // ต้องรอให้แท่งเทียนมีอย่างน้อย X ticks ถึงจะพออ่านหน้าตาได้
+            if c.tick_count < 5 {
+                return ConfirmationResult::Rejected { reason: "waiting for candle formation" };
+            }
+
+            let is_rejection = c.has_rejection_wick(
+                dir == Direction::Buy,
+                config.min_wick_ratio
+            );
+
+            if !is_rejection {
+                debug!("❌ Confirmation REJECTED: waiting for wick rejection");
+                return ConfirmationResult::Rejected { reason: "no wick rejection detected" };
+            }
+            debug!("✓ Candle Rejection confirmed (Wick Ratio >= {})", config.min_wick_ratio);
+        } else {
+            return ConfirmationResult::Rejected { reason: "no candle data available" };
+        }
+    }
+
     debug!(spread, "✅ All confirmations passed — FIRE!");
     ConfirmationResult::Confirmed
 }
@@ -251,6 +288,8 @@ mod tests {
             require_zone_probe: true,
             min_zone_ticks:     2,
             probe_lookback:     10,
+            require_wick_rejection: false,
+            min_wick_ratio:     0.60,
             rsi_overbought:     70.0,
             rsi_oversold:       30.0,
         }
@@ -265,7 +304,7 @@ mod tests {
         let buffer = make_buffer(&[66990.0, 67020.0, 67025.0]);
         let result = check_confirmation(
             67020.0, 67080.0,  // spread = 60 > 50
-            &make_zone(), Direction::Buy, &buffer, None, &make_config()
+            &make_zone(), Direction::Buy, &buffer, None, None, &make_config()
         );
         assert_eq!(result, ConfirmationResult::Rejected { reason: "spread too wide" });
     }
@@ -275,7 +314,7 @@ mod tests {
         let buffer = make_buffer(&[67010.0, 67015.0, 67020.0]);
         let result = check_confirmation(
             67020.0, 67022.0,
-            &make_zone(), Direction::Buy, &buffer, None, &make_config()
+            &make_zone(), Direction::Buy, &buffer, None, None, &make_config()
         );
         assert_eq!(result, ConfirmationResult::Rejected { reason: "no zone probe detected" });
     }
@@ -285,7 +324,7 @@ mod tests {
         let buffer = make_buffer(&[66980.0, 66995.0, 67010.0, 67020.0]);
         let result = check_confirmation(
             67025.0, 67027.0,
-            &make_zone(), Direction::Buy, &buffer, None, &make_config()
+            &make_zone(), Direction::Buy, &buffer, None, None, &make_config()
         );
         assert_eq!(result, ConfirmationResult::Confirmed);
     }
@@ -295,7 +334,7 @@ mod tests {
         let buffer = make_buffer(&[67070.0, 67060.0, 67040.0, 67030.0]);
         let result = check_confirmation(
             67028.0, 67030.0,
-            &make_zone(), Direction::Sell, &buffer, None, &make_config()
+            &make_zone(), Direction::Sell, &buffer, None, None, &make_config()
         );
         assert_eq!(result, ConfirmationResult::Confirmed);
     }
@@ -305,7 +344,7 @@ mod tests {
         let buffer = make_buffer(&[66985.0, 66990.0, 66999.0]);
         let result = check_confirmation(
             67005.0, 67007.0,
-            &make_zone(), Direction::Buy, &buffer, None, &make_config()
+            &make_zone(), Direction::Buy, &buffer, None, None, &make_config()
         );
         assert_eq!(result, ConfirmationResult::Rejected { reason: "insufficient zone dwell" });
     }
@@ -316,7 +355,7 @@ mod tests {
         let buffer = make_buffer(&[66980.0, 66995.0, 67010.0, 67020.0]);
         let result = check_confirmation(
             67025.0, 67027.0,
-            &make_zone(), Direction::Buy, &buffer, Some(75.0), &make_config()
+            &make_zone(), Direction::Buy, &buffer, None, Some(75.0), &make_config()
         );
         assert_eq!(result, ConfirmationResult::Rejected { reason: "rsi out of range" });
     }
@@ -327,7 +366,7 @@ mod tests {
         let buffer = make_buffer(&[66980.0, 66995.0, 67010.0, 67020.0]);
         let result = check_confirmation(
             67025.0, 67027.0,
-            &make_zone(), Direction::Buy, &buffer, Some(55.0), &make_config()
+            &make_zone(), Direction::Buy, &buffer, None, Some(55.0), &make_config()
         );
         assert_eq!(result, ConfirmationResult::Confirmed);
     }

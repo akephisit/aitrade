@@ -17,6 +17,8 @@ struct AiStrategyJson {
     entry_zone_high:  f64,
     take_profit:      f64,
     stop_loss:        f64,
+    opposing_zone_low: Option<f64>,
+    opposing_zone_high: Option<f64>,
     lot_size:         f64,
     rationale:        String,
 }
@@ -31,6 +33,7 @@ pub struct ActiveStrategy {
     pub entry_zone:   EntryZone,
     pub take_profit:  f64,
     pub stop_loss:    f64,
+    pub opposing_zone: Option<EntryZone>,
     pub lot_size:     f64,
     pub rationale:    String,
     pub created_at:   chrono::DateTime<Utc>,
@@ -83,6 +86,10 @@ pub fn parse_strategy_from_ai(
         },
         take_profit: parsed.take_profit,
         stop_loss:   parsed.stop_loss,
+        opposing_zone: match (parsed.opposing_zone_low, parsed.opposing_zone_high) {
+            (Some(low), Some(high)) => Some(EntryZone { low, high }),
+            _ => None,
+        },
         lot_size:    parsed.lot_size,
         rationale:   parsed.rationale,
         created_at:  now,

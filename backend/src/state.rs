@@ -9,6 +9,7 @@ use std::sync::Arc;
 use tokio::sync::{broadcast, RwLock};
 
 use crate::engine::confirmation::{ConfirmationConfig, RecentTick};
+use crate::engine::candle_builder::Candle;
 use crate::models::{ActiveStrategy, OpenPosition, TradeRecord};
 use crate::risk::{RiskConfig, RiskManager};
 
@@ -55,6 +56,10 @@ pub struct AppState {
     /// Key = symbol string, Value = ล่าสุดอยู่ท้าย VecDeque
     pub tick_buffer: Arc<RwLock<HashMap<String, VecDeque<RecentTick>>>>,
 
+    // ── Candle Builder (M1 Rejection Engine) ──────────────────────────────────
+    /// เก็บแท่งเทียนที่กำลังสร้างจาก Tick
+    pub latest_candle: Arc<RwLock<HashMap<String, Candle>>>,
+
     // ── Confirmation Config ───────────────────────────────────────────────────
     pub confirmation_config: Arc<ConfirmationConfig>,
 
@@ -75,6 +80,7 @@ impl AppState {
             tick_count:          Arc::new(std::sync::atomic::AtomicU64::new(0)),
             trade_count:         Arc::new(std::sync::atomic::AtomicU64::new(0)),
             tick_buffer:         Arc::new(RwLock::new(HashMap::new())),
+            latest_candle:       Arc::new(RwLock::new(HashMap::new())),
             confirmation_config: Arc::new(ConfirmationConfig::from_env()),
             risk:                Arc::new(RiskManager::new(RiskConfig::from_env())),
         }
@@ -119,12 +125,34 @@ impl AppState {
             entry.pop_front();  // ลบ Tick เก่าสุด
         }
         entry.push_back(RecentTick::new(bid, ask));
+
+        // ── สร้างหรืออัปเดตแท่งเทียน (M1) ──────────────────────────────────────────
+        let mut candles = self.latest_candle.write().await;
+        let mid_price = (bid + ask) / 2.0;
+        let now = chrono::Utc::now();
+        
+        let candle = candles.entry(symbol.to_string()).or_insert_with(|| {
+            Candle::new(symbol, now, mid_price)
+        });
+
+        // ถ้าเข้าสู่นาทีใหม่ เริ่มแท่งใหม่
+        if now.timestamp() / 60 > candle.start_time.timestamp() / 60 {
+            *candle = Candle::new(symbol, now, mid_price);
+        } else {
+            candle.update(mid_price);
+        }
     }
 
     /// อ่าน Tick Buffer ของ symbol (clone ออกมาเพื่อปล่อย lock)
     pub async fn get_tick_buffer(&self, symbol: &str) -> VecDeque<RecentTick> {
         let buffer = self.tick_buffer.read().await;
         buffer.get(symbol).cloned().unwrap_or_default()
+    }
+
+    /// อ่านแท่งเทียนล่าสุด
+    pub async fn get_latest_candle(&self, symbol: &str) -> Option<Candle> {
+        let candles = self.latest_candle.read().await;
+        candles.get(symbol).cloned()
     }
 }
 

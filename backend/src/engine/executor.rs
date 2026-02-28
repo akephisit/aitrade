@@ -84,6 +84,15 @@ pub async fn fire_trade(
     client: &reqwest::Client,
     mt5_base_url: &str,
 ) -> Result<Mt5OrderResponse, AppError> {
+    if mt5_base_url == "mock" {
+        info!("🎭 [EXECUTOR] Running in MOCK mode — simulating MT5 success");
+        return Ok(Mt5OrderResponse {
+            retcode: 10009,
+            order:   Some(999999),
+            comment: Some("Mock Order".to_string()),
+        });
+    }
+
     let url = format!("{mt5_base_url}/order/send");
 
     info!(

@@ -18,11 +18,12 @@
 │                                                                     │
 │  POST /api/mt5/tick ──► [Reflex Engine]                             │
 │                              │                                      │
-│                         4-Layer Confirmation:                       │
+│                         5-Layer Confirmation:                       │
 │                         [1] Spread Check                            │
 │                         [2] Zone Probe (Bounce Pattern)             │
 │                         [3] Zone Dwell (≥ N ticks)                  │
-│                         [4] RSI Filter (optional)                   │
+│                         [4] Wick Rejection (M1 SMC logic)           │
+│                         [5] RSI Filter (optional)                   │
 │                              │                                      │
 │                         [Risk Manager] ──► Kill Switch / Limits     │
 │                              │                                      │
@@ -127,6 +128,8 @@ npm run dev
 | `CONFIRM_REQUIRE_PROBE` | `true` | ต้องมี Zone Probe ก่อนเข้า |
 | `CONFIRM_MIN_ZONE_TICKS` | `2` | Ticks ขั้นต่ำใน Zone |
 | `CONFIRM_PROBE_LOOKBACK` | `15` | Ticks ย้อนหลังสำหรับ Probe |
+| `CONFIRM_REQUIRE_WICK_REJECTION` | `true` | ต้องมี Wick Rejection M1 |
+| `CONFIRM_MIN_WICK_RATIO` | `0.60` | ส่วนของไส้ต้อง >= 60% ของแท่ง |
 | `CONFIRM_RSI_OVERBOUGHT` | `70.0` | RSI Overbought (BUY ห้าม ≥ นี้) |
 | `CONFIRM_RSI_OVERSOLD` | `30.0` | RSI Oversold (SELL ห้าม ≤ นี้) |
 | `RISK_MAX_TRADES_PER_DAY` | `10` | Trade สูงสุดต่อวัน |
@@ -288,7 +291,7 @@ aitrade/
 
 ---
 
-## Confirmation Engine (4 Layers)
+## Confirmation Engine (5 Layers)
 
 ```
 Price enters Entry Zone
@@ -305,7 +308,10 @@ Price enters Entry Zone
 [3] Zone Dwell ≥ N ticks         → ไม่ใช่แค่ Wick ผ่าน
         │
         ▼
-[4] RSI in range (if provided)   → ไม่ Overbought/Oversold
+[4] Wick Rejection (SMC)         → แท่ง M1 เกิดไส้เทียนตบกลับ >= 60%
+        │
+        ▼
+[5] RSI in range (if provided)   → ไม่ Overbought/Oversold
     BUY:  RSI < 70
     SELL: RSI > 30
         │

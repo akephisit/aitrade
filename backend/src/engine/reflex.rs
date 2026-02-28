@@ -31,6 +31,8 @@ pub enum TradeSignal {
     Trigger(Box<ActiveStrategy>),
     /// ส่งให้กลับไปสั่ง MT5 ทำการแก้ไข Position (เช่น เลื่อน SL บังทุน)
     ModifySL { mt5_ticket: u64, new_sl: f64, reason: String },
+    /// ปิด Position เนื่องจากเข้า Opposing Zone
+    ClosePosition { mt5_ticket: u64, reason: String },
     /// ไม่มีอะไรต้องทำ Tick นี้
     NoAction,
 }
@@ -108,6 +110,30 @@ pub async fn evaluate_tick(
                     });
                 }
             }
+            // ── 7.5 [SMC Pro Max] Opposing Zone Bailout ─────────────────────────
+            if let Some(opp_zone) = &strategy.opposing_zone {
+                let current_price = match pos_guard.direction {
+                    Direction::Buy  => tick.bid,
+                    Direction::Sell => tick.ask,
+                    Direction::NoTrade => tick.bid,
+                };
+                if opp_zone.contains(current_price) {
+                    let ticket = pos_guard.mt5_ticket.unwrap_or(0);
+                    if ticket > 0 {
+                        info!(
+                            symbol = %tick.symbol,
+                            ticket,
+                            current_price,
+                            "⚔️ OPPOSING ZONE ENTERED — Bailing out of position!"
+                        );
+                        return Ok(TradeSignal::ClosePosition {
+                            mt5_ticket: ticket,
+                            reason:     "OPPOSING_ZONE_BAILOUT".to_string(),
+                        });
+                    }
+                }
+            }
+
             debug!(symbol = %tick.symbol, "Position already open — double-entry blocked");
         }
         return Ok(TradeSignal::NoAction);
@@ -141,6 +167,7 @@ pub async fn evaluate_tick(
 
     // ── 10. [NEW] Confirmation Engine ────────────────────────────────────────
     let tick_buffer = state.get_tick_buffer(&tick.symbol).await;
+    let candle      = state.get_latest_candle(&tick.symbol).await;
     let config      = &*state.confirmation_config;
 
     let confirmation = check_confirmation(
@@ -149,6 +176,7 @@ pub async fn evaluate_tick(
         &strategy.entry_zone,
         strategy.direction,
         &tick_buffer,
+        candle.as_ref(),
         tick.rsi_14,      // ← ส่ง RSI จาก TickData (ถ้า None → ข้าม RSI check)
         config,
     );

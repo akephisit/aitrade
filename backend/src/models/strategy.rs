@@ -74,6 +74,9 @@ pub struct ActiveStrategy {
     /// Stop-loss price level.
     pub stop_loss: f64,
 
+    /// โซนตรงข้าม (Supply/Demand ดักหน้า) ที่ใช้สำหรับระบบ Bailout (เผ่นก่อนชน)
+    pub opposing_zone: Option<EntryZone>,
+
     /// Lot size / position size, e.g. `0.10` for 0.10 lots.
     pub lot_size: f64,
 

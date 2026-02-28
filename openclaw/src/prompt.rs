@@ -45,6 +45,8 @@ Analyze the market conditions and provide a precise trading strategy.
   "entry_zone_high": <float>,
   "take_profit": <float>,
   "stop_loss": <float>,
+  "opposing_zone_low": <float or null>,
+  "opposing_zone_high": <float or null>,
   "lot_size": 0.10,
   "rationale": "<brief explanation max 100 chars>"
 }}
@@ -58,6 +60,7 @@ Analyze the market conditions and provide a precise trading strategy.
 5. Entry zone width should be 20-100 pips max
 6. Risk/Reward ratio must be >= 1.5
 7. Strategy is valid for {ttl} minutes
+8. You may specify an `opposing_zone` (Supply/Demand ahead of target) where we should exit early if price struggles there (Bailout).
 
 Respond with JSON only:"#,
         price  = snapshot.current_price,
