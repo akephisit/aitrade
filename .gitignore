@@ -1,1 +1,42 @@
-target
+# ── Rust ──────────────────────────────────────────────────────────────────────
+target/
+**/*.rs.bk
+Cargo.lock.bk
+
+# ── Node / Frontend ───────────────────────────────────────────────────────────
+node_modules/
+.svelte-kit/
+frontend/build/
+frontend/.env
+frontend/.env.local
+
+# ── Environment / Secrets ──────────────────────────────────────────────────────
+.env
+.env.local
+.env.production
+!.env.example
+!backend/.env.example
+!openclaw/.env.example
+
+# ── Docker ────────────────────────────────────────────────────────────────────
+.docker/
+
+# ── Editor ────────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# ── Database ──────────────────────────────────────────────────────────────────
+*.sqlite
+*.db
+pgdata/
+
+# ── MT5 Compiled Files ────────────────────────────────────────────────────────
+mt5-bridge/*.ex5
+
+# ── Logs ──────────────────────────────────────────────────────────────────────
+*.log
+logs/

@@ -1,246 +1,243 @@
 //+------------------------------------------------------------------+
-//| AntGravityBridge.mq5                                             |
-//| MetaTrader 5 EA — Antigravity Trading System Bridge              |
-//|                                                                  |
-//| หน้าที่:                                                          |
-//|   1. OnTick() → POST ราคาไปยัง aitrade /api/mt5/tick             |
-//|   2. Response = TRADE_TRIGGERED → Execute Order ทันที            |
-//|                                                                  |
-//| วิธีติดตั้ง:                                                      |
-//|   1. Copy ไฟล์นี้ไปที่ MT5 Data Folder/MQL5/Experts/             |
-//|   2. Compile ใน MetaEditor (F7)                                  |
-//|   3. Tools > Options > Expert Advisors:                          |
-//|      ✅ Allow automated trading                                  |
-//|      ✅ Allow WebRequest for listed URL:                         |
-//|         http://127.0.0.1:3000                                    |
-//|   4. Drag EA ลงบน Chart ของ Symbol ที่ต้องการ                    |
+//|                                          AntGravityBridge.mq5   |
+//|           Antigravity Trading System — MetaTrader 5 Bridge      |
+//|  v2.0 — เพิ่ม OnTradeTransaction (Position Close) + RSI Sender  |
 //+------------------------------------------------------------------+
-#property copyright "Antigravity Trading System"
-#property version   "1.00"
+#property copyright "Antigravity Team"
+#property version   "2.00"
 #property strict
 
 #include <Trade\Trade.mqh>
-#include <JAson.mqh>   // ต้องดาวน์โหลด JAson.mqh จาก MQL5 Market
+#include <Trade\DealInfo.mqh>
+#include <Indicators\Oscilators.mqh>
 
-//--- Input Parameters
-input string   InpAitradeUrl    = "http://127.0.0.1:3000"; // aitrade Backend URL
-input int      InpTimeoutMs     = 3000;                     // HTTP Timeout (ms)
-input bool     InpSendEveryTick = true;                     // ส่งทุก Tick
-input int      InpSendIntervalMs= 100;                      // ถ้าไม่ส่งทุก Tick ส่งทุก N ms
-input ulong    InpMagicNumber   = 420001;                   // Magic Number ของ Antigravity
+//── Input Parameters ──────────────────────────────────────────────────────────
+input string BackendURL    = "http://127.0.0.1:3000";  // Antigravity backend URL
+input int    RSI_Period    = 14;                        // RSI Period
+input int    MA_Fast       = 20;                        // MA Fast Period
+input int    MA_Slow       = 50;                        // MA Slow Period
+input string ApiKey        = "";                        // X-API-Key (ถ้าตั้งไว้ใน backend)
+input int    TimeoutMs     = 5000;                      // HTTP Timeout (ms)
 
-//--- Global Variables
-CTrade         g_trade;
-datetime       g_last_send_time = 0;
-int            g_tick_count     = 0;
+//── Global Variables ──────────────────────────────────────────────────────────
+CTrade g_trade;
+int    g_rsi_handle  = INVALID_HANDLE;
+int    g_ma20_handle = INVALID_HANDLE;
+int    g_ma50_handle = INVALID_HANDLE;
 
-//+------------------------------------------------------------------+
-//| Expert initialization                                            |
-//+------------------------------------------------------------------+
+//── Init ───────────────────────────────────────────────────────────────────────
 int OnInit() {
-   g_trade.SetExpertMagicNumber(InpMagicNumber);
-   g_trade.SetDeviationInPoints(10);   // Slippage tolerance
-   
-   Print("AntGravityBridge started | Symbol: ", Symbol(), 
-         " | Backend: ", InpAitradeUrl);
-   
-   return(INIT_SUCCEEDED);
+    // สร้าง Indicator Handles (สร้างครั้งเดียว ไม่สร้างใหม่ทุก Tick)
+    g_rsi_handle  = iRSI(_Symbol,  PERIOD_CURRENT, RSI_Period, PRICE_CLOSE);
+    g_ma20_handle = iMA(_Symbol,   PERIOD_CURRENT, MA_Fast, 0, MODE_EMA, PRICE_CLOSE);
+    g_ma50_handle = iMA(_Symbol,   PERIOD_CURRENT, MA_Slow, 0, MODE_EMA, PRICE_CLOSE);
+
+    if (g_rsi_handle == INVALID_HANDLE) {
+        Print("❌ RSI handle failed");
+        return INIT_FAILED;
+    }
+
+    Print("✅ AntGravityBridge v2.0 initialized | Symbol: ", _Symbol,
+          " | Backend: ", BackendURL);
+    return INIT_SUCCEEDED;
 }
 
-//+------------------------------------------------------------------+
-//| Expert deinitialization                                          |
-//+------------------------------------------------------------------+
+//── DeInit ─────────────────────────────────────────────────────────────────────
 void OnDeinit(const int reason) {
-   Print("AntGravityBridge stopped | Ticks sent: ", g_tick_count);
+    if (g_rsi_handle  != INVALID_HANDLE) IndicatorRelease(g_rsi_handle);
+    if (g_ma20_handle != INVALID_HANDLE) IndicatorRelease(g_ma20_handle);
+    if (g_ma50_handle != INVALID_HANDLE) IndicatorRelease(g_ma50_handle);
+    Print("AntGravityBridge deinit | Reason: ", reason);
 }
 
-//+------------------------------------------------------------------+
-//| OnTick — ส่งราคาไป aitrade ทุกครั้งที่ราคาเปลี่ยน               |
-//+------------------------------------------------------------------+
+//── OnTick ─────────────────────────────────────────────────────────────────────
 void OnTick() {
-   // Rate limiting (ถ้าไม่ต้องการส่งทุก Tick)
-   if(!InpSendEveryTick) {
-      if(GetTickCount() - (ulong)g_last_send_time < (ulong)InpSendIntervalMs)
-         return;
-   }
-   
-   MqlTick tick;
-   if(!SymbolInfoTick(Symbol(), tick)) {
-      Print("ERROR: Cannot get tick for ", Symbol());
-      return;
-   }
-   
-   // สร้าง JSON payload
-   string payload = BuildTickPayload(tick);
-   
-   // ส่งไป aitrade และรับ Response
-   string response = PostToAitrade("/api/mt5/tick", payload);
-   
-   if(response == "") return;   // HTTP Error
-   
-   g_tick_count++;
-   
-   // Parse Response
-   HandleTickResponse(response, tick);
+    MqlTick tick;
+    if (!SymbolInfoTick(_Symbol, tick)) return;
+
+    // ── ดึงค่า Indicators ──────────────────────────────────────────────────────
+    double rsi_val  = GetIndicatorValue(g_rsi_handle);
+    double ma20_val = GetIndicatorValue(g_ma20_handle);
+    double ma50_val = GetIndicatorValue(g_ma50_handle);
+
+    // ── สร้าง JSON payload ──────────────────────────────────────────────────────
+    string payload = StringFormat(
+        "{"
+        "\"symbol\":\"%s\","
+        "\"bid\":%.5f,"
+        "\"ask\":%.5f,"
+        "\"volume\":%.2f,"
+        "\"time\":\"%s\","
+        "\"rsi_14\":%.4f,"
+        "\"ma_20\":%.5f,"
+        "\"ma_50\":%.5f"
+        "}",
+        _Symbol,
+        tick.bid, tick.ask, (double)tick.volume,
+        TimeToString(tick.time, TIME_DATE | TIME_SECONDS) + "Z",
+        rsi_val,
+        ma20_val,
+        ma50_val
+    );
+
+    // ── POST ไป Backend ────────────────────────────────────────────────────────
+    string response = HttpPost(BackendURL + "/api/mt5/tick", payload);
+    if (response == "") return;
+
+    // ── Parse Response ─────────────────────────────────────────────────────────
+    if (StringFind(response, "\"TRADE_TRIGGERED\"") >= 0) {
+        HandleTradeSignal(response, tick);
+    }
 }
 
-//+------------------------------------------------------------------+
-//| สร้าง JSON Payload สำหรับ /api/mt5/tick                         |
-//+------------------------------------------------------------------+
-string BuildTickPayload(const MqlTick &tick) {
-   datetime utc_time = tick.time;   // MT5 time ปกติเป็น server time
-   
-   string time_str = TimeToString(utc_time, TIME_DATE|TIME_SECONDS);
-   StringReplace(time_str, ".", "-");          // 2025.01.01 → 2025-01-01
-   StringReplace(time_str, " ", "T");          // 2025-01-01 12:00:00 → 2025-01-01T12:00:00
-   time_str += "Z";                            // เพิ่ม UTC suffix
-   
-   string json = StringFormat(
-      "{"
-         "\"symbol\":\"%s\","
-         "\"bid\":%.5f,"
-         "\"ask\":%.5f,"
-         "\"volume\":%.2f,"
-         "\"time\":\"%s\""
-      "}",
-      Symbol(),
-      tick.bid,
-      tick.ask,
-      tick.volume_real,
-      time_str
-   );
-   
-   return json;
+//── OnTradeTransaction — ตรวจจับเมื่อ MT5 ปิด Position (TP / SL / Manual) ────
+void OnTradeTransaction(
+    const MqlTradeTransaction& trans,
+    const MqlTradeRequest&     request,
+    const MqlTradeResult&      result
+) {
+    // ต้องการแค่ DEAL_ADD (เมื่อมี Deal ใหม่ = position ถูกปิด)
+    if (trans.type != TRADE_TRANSACTION_DEAL_ADD) return;
+
+    CDealInfo deal;
+    if (!deal.Ticket(trans.deal)) return;
+
+    // เฉพาะ Deal ที่เป็นการปิด Position (ENTRY_OUT) หรือ Reverse (ENTRY_INOUT)
+    ENUM_DEAL_ENTRY entry = deal.Entry();
+    if (entry != DEAL_ENTRY_OUT && entry != DEAL_ENTRY_INOUT) return;
+
+    // ── หาสาเหตุที่ปิด ────────────────────────────────────────────────────────
+    string close_reason = "MANUAL";
+    switch (deal.Reason()) {
+        case DEAL_REASON_TP:     close_reason = "TP";     break;
+        case DEAL_REASON_SL:     close_reason = "SL";     break;
+        case DEAL_REASON_EXPERT: close_reason = "EXPERT";  break;
+        case DEAL_REASON_CLIENT: close_reason = "MANUAL";  break;
+        default:                 close_reason = "OTHER";   break;
+    }
+
+    double close_price = deal.Price();
+    double profit      = deal.Profit();
+    long   ticket      = deal.Ticket();
+    string symbol      = deal.Symbol();
+
+    Print("📤 Position closed | ", close_reason, " | Price: ", close_price,
+          " | Profit: ", profit, " | Ticket: ", ticket);
+
+    // ── ส่งไปยัง Backend ───────────────────────────────────────────────────────
+    NotifyPositionClose(symbol, ticket, close_price, profit, close_reason);
 }
 
-//+------------------------------------------------------------------+
-//| ส่ง HTTP POST ไป aitrade และคืน response body                    |
-//+------------------------------------------------------------------+
-string PostToAitrade(const string endpoint, const string body) {
-   string url      = InpAitradeUrl + endpoint;
-   string headers  = "Content-Type: application/json\r\n";
-   char   data[];
-   char   result[];
-   string result_headers;
-   
-   StringToCharArray(body, data, 0, StringLen(body));
-   
-   int http_code = WebRequest(
-      "POST",           // Method
-      url,              // URL
-      headers,          // Headers
-      InpTimeoutMs,     // Timeout
-      data,             // Request body
-      result,           // Response body
-      result_headers    // Response headers
-   );
-   
-   if(http_code == -1) {
-      int err = GetLastError();
-      // Error 4060 = WebRequest ไม่ได้ Whitelist URL
-      if(err == 4060)
-         Print("ERROR: Add '", InpAitradeUrl, "' to Tools > Options > Expert Advisors > WebRequest URLs");
-      else
-         Print("HTTP Error: ", err, " | URL: ", url);
-      return "";
-   }
-   
-   if(http_code != 200) {
-      Print("HTTP ", http_code, " from aitrade | endpoint: ", endpoint);
-      return "";
-   }
-   
-   return CharArrayToString(result);
+//── Helpers ─────────────────────────────────────────────────────────────────────
+
+double GetIndicatorValue(int handle) {
+    if (handle == INVALID_HANDLE) return 0.0;
+    double buffer[];
+    if (CopyBuffer(handle, 0, 0, 1, buffer) <= 0) return 0.0;
+    return buffer[0];
 }
 
-//+------------------------------------------------------------------+
-//| Parse Response จาก /api/mt5/tick และ Execute Order ถ้าจำเป็น    |
-//+------------------------------------------------------------------+
-void HandleTickResponse(const string response, const MqlTick &tick) {
-   // ตรวจสอบว่ามี TRADE_TRIGGERED ไหม
-   if(StringFind(response, "TRADE_TRIGGERED") == -1)
-      return;   // NO_ACTION — จบ
-   
-   // Parse JSON response
-   // Expected: {"action":"TRADE_TRIGGERED","direction":"BUY","entry_price":67032.0,"tp":67100.0,"sl":66900.0,...}
-   string direction    = ExtractJsonString(response, "direction");
-   double entry_price  = ExtractJsonDouble(response, "entry_price");
-   double tp           = ExtractJsonDouble(response, "tp");
-   double sl           = ExtractJsonDouble(response, "sl");
-   
-   Print("🎯 TRADE_TRIGGERED | direction=", direction, 
-         " | entry=", entry_price, " | TP=", tp, " | SL=", sl);
-   
-   // Execute Order
-   bool success = false;
-   
-   if(direction == "BUY") {
-      success = g_trade.Buy(
-         0.10,          // Volume (lot_size จาก strategy ถ้าต้องการก็ parse เพิ่ม)
-         Symbol(),      // Symbol
-         0,             // Price = 0 ใช้ Market Price
-         sl,            // Stop Loss
-         tp,            // Take Profit
-         StringFormat("AGV-BRIDGE")
-      );
-   } else if(direction == "SELL") {
-      success = g_trade.Sell(
-         0.10,
-         Symbol(),
-         0,
-         sl,
-         tp,
-         StringFormat("AGV-BRIDGE")
-      );
-   }
-   
-   if(success) {
-      Print("✅ Order executed | Ticket: ", g_trade.ResultOrder());
-      // แจ้ง aitrade ว่า MT5 confirm แล้ว (optional)
-      NotifyOrderConfirm(g_trade.ResultOrder());
-   } else {
-      Print("❌ Order failed | Error: ", GetLastError(), " | Retcode: ", g_trade.ResultRetcode());
-   }
+string BuildHeaders() {
+    string headers = "Content-Type: application/json\r\n";
+    if (ApiKey != "") {
+        headers += "X-API-Key: " + ApiKey + "\r\n";
+    }
+    return headers;
 }
 
-//+------------------------------------------------------------------+
-//| แจ้ง aitrade ว่า MT5 Confirm Order แล้ว (optional)               |
-//+------------------------------------------------------------------+
-void NotifyOrderConfirm(ulong ticket) {
-   string payload = StringFormat(
-      "{\"mt5_ticket\":%llu,\"status\":\"CONFIRMED\"}",
-      ticket
-   );
-   // TODO: POST ไปที่ /api/mt5/confirm endpoint (ถ้าต้องการ implement)
-   // PostToAitrade("/api/mt5/confirm", payload);
+string HttpPost(string url, string body) {
+    char   req[];
+    char   res[];
+    string res_headers;
+    StringToCharArray(body, req, 0, StringLen(body));
+
+    int status = WebRequest(
+        "POST", url,
+        BuildHeaders(), TimeoutMs,
+        req, res, res_headers
+    );
+
+    if (status == 200 || status == 201) {
+        return CharArrayToString(res);
+    }
+
+    if (status == -1) {
+        Print("❌ WebRequest failed: URL not whitelisted? | URL: ", url);
+    } else {
+        Print("⚠️ Backend returned HTTP ", status, " | URL: ", url);
+    }
+    return "";
 }
 
-//+------------------------------------------------------------------+
-//| Helper: Extract JSON string value                                 |
-//+------------------------------------------------------------------+
-string ExtractJsonString(const string json, const string key) {
-   string search = "\"" + key + "\":\"";
-   int start = StringFind(json, search);
-   if(start == -1) return "";
-   start += StringLen(search);
-   int end = StringFind(json, "\"", start);
-   if(end == -1) return "";
-   return StringSubstr(json, start, end - start);
+void NotifyPositionClose(string symbol, long ticket, double close_price,
+                          double profit, string close_reason) {
+    string payload = StringFormat(
+        "{"
+        "\"mt5_ticket\":%d,"
+        "\"symbol\":\"%s\","
+        "\"close_price\":%.5f,"
+        "\"profit_pips\":%.4f,"
+        "\"close_reason\":\"%s\""
+        "}",
+        ticket, symbol, close_price, profit, close_reason
+    );
+
+    string response = HttpPost(BackendURL + "/api/mt5/position-close", payload);
+    if (StringFind(response, "\"ok\":true") >= 0) {
+        Print("✅ Backend notified: position closed | ", close_reason);
+    } else {
+        Print("⚠️ Backend position-close notification failed | Response: ", response);
+    }
 }
 
-//+------------------------------------------------------------------+
-//| Helper: Extract JSON double value                                 |
-//+------------------------------------------------------------------+
-double ExtractJsonDouble(const string json, const string key) {
-   string search = "\"" + key + "\":";
-   int start = StringFind(json, search);
-   if(start == -1) return 0.0;
-   start += StringLen(search);
-   // หาจนถึง , หรือ }
-   int end = start;
-   while(end < StringLen(json) && 
-         StringGetCharacter(json, end) != ',' && 
-         StringGetCharacter(json, end) != '}') end++;
-   return StringToDouble(StringSubstr(json, start, end - start));
+void HandleTradeSignal(string response, const MqlTick& tick) {
+    // Parse direction
+    string direction = "BUY";
+    if (StringFind(response, "\"direction\":\"SELL\"") >= 0) direction = "SELL";
+    if (StringFind(response, "\"direction\":\"Sell\"") >= 0) direction = "SELL";
+
+    // Parse TP/SL/Lots
+    double tp   = ParseDouble(response, "\"tp\":");
+    double sl   = ParseDouble(response, "\"sl\":");
+    double lots = ParseDouble(response, "\"lot_size\":");
+    if (lots <= 0) lots = 0.01;
+
+    Print("🎯 Trade signal received | ", direction,
+          " | TP: ", tp, " | SL: ", sl, " | Lots: ", lots);
+
+    MqlTradeRequest  req  = {};
+    MqlTradeResult   res  = {};
+
+    req.action    = TRADE_ACTION_DEAL;
+    req.symbol    = _Symbol;
+    req.volume    = lots;
+    req.type      = (direction == "BUY") ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
+    req.price     = (direction == "BUY") ? tick.ask : tick.bid;
+    req.sl        = sl;
+    req.tp        = tp;
+    req.deviation = 10;
+    req.magic     = 202600;
+    req.comment   = "Antigravity";
+    req.type_filling = ORDER_FILLING_IOC;
+
+    if (!OrderSend(req, res)) {
+        int err = GetLastError();
+        Print("❌ OrderSend failed | Error: ", err, " | Retcode: ", res.retcode);
+    } else {
+        Print("✅ Order sent | Ticket: ", res.order,
+              " | Price: ", res.price, " | Retcode: ", res.retcode);
+    }
+}
+
+double ParseDouble(string json, string key) {
+    int pos = StringFind(json, key);
+    if (pos < 0) return 0.0;
+    string val = StringSubstr(json, pos + StringLen(key));
+    // หยุดที่ , หรือ }
+    int end1 = StringFind(val, ",");
+    int end2 = StringFind(val, "}");
+    int end  = (end1 < 0) ? end2 : (end2 < 0) ? end1 : MathMin(end1, end2);
+    if (end > 0) val = StringSubstr(val, 0, end);
+    return StringToDouble(val);
 }
 //+------------------------------------------------------------------+

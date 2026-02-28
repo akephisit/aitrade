@@ -29,6 +29,7 @@ use tower_http::{
 use tracing::info;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
+mod auth;
 mod engine;
 mod error;
 mod events;
@@ -37,6 +38,7 @@ mod risk;
 mod routes;
 mod state;
 
+use auth::require_api_key;
 use routes::{
     backtest::run_backtest,
     brain::{clear_strategy, get_strategy, set_strategy},
@@ -99,6 +101,7 @@ async fn main() -> anyhow::Result<()> {
         // ── Backtesting ───────────────────────────────────────────────────────
         .route("/api/backtest",           post(run_backtest))
         // ── Middleware ────────────────────────────────────────────────────────
+        .layer(axum::middleware::from_fn(require_api_key))
         .layer(TraceLayer::new_for_http())
         .layer(cors)
         .with_state(state);
